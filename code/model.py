@@ -1,19 +1,17 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
-from config import MODEL_NAME, CACHE_DIR
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import os
+os.environ['HF_HOME'] = '/workspace/.cache/huggingface'
 
+MODEL_NAME = "upstage/SOLAR-10.7B-Instruct-v1.0"
+cache_dir_path = "/dev/shm/huggingface_cache"
 def load_model():
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16
-    )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         device_map="auto",
-        quantization_config=quantization_config,
         torch_dtype=torch.float16,
-        cache_dir=CACHE_DIR
+        cache_dir=cache_dir_path
     )
     pipe = pipeline(
         "text-generation",
