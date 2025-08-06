@@ -24,14 +24,14 @@ def main():
         print(f"\n[문항 {idx+1}] 프롬프트 생성 완료:\n{prompt[:100]}...")  # 프롬프트 일부 출력
         output = pipe(prompt, max_new_tokens=256, temperature=0.3, top_p=0.9)
         print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text'][:100]}...")  # 출력 일부
-        pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q)
+        pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
         print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
         preds.append(pred_answer)
 
     print("\n✅ 추론 완료!")
     print(f"생성된 답변 개수: {len(preds)}")
     
-    experiment_name = "baseline_batch.csv"
+    experiment_name = "solar_postcessing.csv"
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv(DATA_PATH + "sample_submission.csv")
     sample_submission['Answer'] = preds
