@@ -14,21 +14,24 @@ fewshot_examples = """
 """
 
 def make_prompt_auto(text):
+    role_instruction = "당신은 금융보안 전문가이자, 금융보안원 소속의 베테랑 연구원입니다. 한국어로 주어진 질문에 대해 다음 지시에 따라 답변하세요." # <-- 한국어 답변 지시 추가
+
     if is_multiple_choice(text):
         question, options = extract_question_and_choices(text)
         prompt = (
-            "당신은 금융보안 전문가이자, 금융보안원 소속의 베테랑 연구원입니다. 아래 질문에 대해 가장 정확하고 신뢰성 있는 답변을 제공하세요.\\n"
-            "아래 질문에 대해 적절한 **정답 선택지 번호만 출력**하세요.\n\n"
+            f"{role_instruction}\n\n"
+            "**지시:** 가장 적절한 정답 선택지 번호만 출력하세요.\n\n"
             f"질문: {question}\n"
             "선택지:\n"
             f"{chr(10).join(options)}\n\n"
             "답변:"
         )
     else:
+        question_text = text
         prompt = (
-            "당신은 금융보안 전문가이자, 금융보안원 소속의 베테랑 연구원입니다. 아래 질문에 대해 가장 정확하고 신뢰성 있는 답변을 제공하세요.\\n"
-            "아래 주관식 질문에 대해 정확하고 간략한 설명을 작성하세요.\n\n"
-            f"질문: {text}\n\n"
+            f"{role_instruction}\n\n"
+            "**지시:** 핵심 키워드를 포함하여 정확하고 간략한 설명을 작성하세요.\n\n"
+            f"질문: {question_text}\n\n"
             "답변:"
         )
     return prompt

@@ -22,7 +22,7 @@ def main():
     for idx, q in enumerate(tqdm(test['Question'], desc="Inference")):
         prompt = PROMPT_FUNC(q)
         print(f"\n[문항 {idx+1}] 프롬프트 생성 완료:\n{prompt[:100]}...")  # 프롬프트 일부 출력
-        output = pipe(prompt, max_new_tokens=128, temperature=0.2, top_p=0.9)
+        output = pipe(prompt, max_new_tokens=256, temperature=0.3, top_p=0.9)
         print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text'][:100]}...")  # 출력 일부
         pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q)
         print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
