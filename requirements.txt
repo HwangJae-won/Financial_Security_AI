@@ -1,35 +1,13 @@
-accelerate==1.9.0
-certifi==2022.12.7
-charset-normalizer==2.1.1
-filelock==3.13.1
-fsspec==2024.6.1
-hf-xet==1.1.7
-huggingface-hub==0.34.3
-idna==3.4
-Jinja2==3.1.4
-MarkupSafe==2.1.5
-mpmath==1.3.0
-networkx==3.3
-numpy==1.26.4
-packaging==25.0
-pandas==2.3.1
-pillow==11.0.0
-psutil==7.0.0
-python-dateutil==2.9.0.post0
-pytz==2025.2
-PyYAML==6.0.2
-regex==2025.7.34
-requests==2.28.1
-safetensors==0.4.1
-six==1.17.0
-sympy==1.13.3
-tokenizers==0.15.2
+# PyTorch (CUDA 11.8 환경 가정)
 torch==2.1.0+cu118
-torchaudio==2.1.0+cu118
-torchvision==0.16.0+cu118
-tqdm==4.67.1
-transformers==4.35.2
-triton==2.1.0
-typing_extensions==4.12.2
-tzdata==2025.2
-urllib3==1.26.13
+
+# Hugging Face 기본
+transformers>=4.35,<4.42
+tokenizers>=0.15,<0.16
+accelerate>=0.28,<1.0
+safetensors>=0.4.1,<0.6
+huggingface-hub>=0.20
+
+# 편의
+tqdm>=4.66
+pandas>=2.2

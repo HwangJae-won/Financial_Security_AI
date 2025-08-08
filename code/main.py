@@ -1,12 +1,12 @@
 import pandas as pd
 from tqdm import tqdm
 from model import load_model
-from prompt import make_prompt_fewshot
+from prompt import make_prompt_auto
 from utils import extract_answer_only
 
 DATA_PATH = "data/"
 OUTPUT_PATH = "results/"
-PROMPT_FUNC = make_prompt_fewshot 
+PROMPT_VERSION = "v2" 
 
 def main():
     print("📂 테스트 데이터 로딩 중...")
@@ -20,10 +20,10 @@ def main():
     preds = []
     print("🚀 추론 시작!")
     for idx, q in enumerate(tqdm(test['Question'], desc="Inference")):
-        prompt = PROMPT_FUNC(q)
+        prompt = make_prompt_auto(q, version = PROMPT_VERSION)
         print(f"\n[문항 {idx+1}] 프롬프트 생성 완료:\n{prompt[:100]}...")  # 프롬프트 일부 출력
-        output = pipe(prompt, max_new_tokens=256, temperature=0.3, top_p=0.9)
-        print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text'][:100]}...")  # 출력 일부
+        output = pipe(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
+        print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text']}")  # 출력 일부
         pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
         print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
         preds.append(pred_answer)
