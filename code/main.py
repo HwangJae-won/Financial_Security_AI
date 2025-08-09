@@ -4,6 +4,14 @@ from model import load_model
 from prompt import make_prompt_auto
 from utils import extract_answer_only
 
+
+from transformers import AutoTokenizer
+
+# tokenizer는 바깥에서 만든 걸 주입하세요.
+MODEL_NAME = "upstage/SOLAR-10.7B-Instruct-v1.0"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+
 DATA_PATH = "data/"
 OUTPUT_PATH = "results/"
 PROMPT_VERSION = "v2" 
@@ -20,9 +28,11 @@ def main():
     preds = []
     print("🚀 추론 시작!")
     for idx, q in enumerate(tqdm(test['Question'], desc="Inference")):
-        prompt = make_prompt_auto(q, version = PROMPT_VERSION)
+        # prompt = make_prompt_auto(q, version = PROMPT_VERSION)
+        prompt, gen_kwargs = make_prompt_auto(q, tokenizer, version="v2")
         print(f"\n[문항 {idx+1}] 프롬프트 생성 완료:\n{prompt[:100]}...")  # 프롬프트 일부 출력
-        output = pipe(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
+        # output = pipe(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
+        output = pipe(prompt, **gen_kwargs)
         print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text']}")  # 출력 일부
         pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
         print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
