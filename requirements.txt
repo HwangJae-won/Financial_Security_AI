@@ -4,7 +4,7 @@ torch==2.1.0+cu118
 # Hugging Face 기본
 transformers>=4.35,<4.42
 tokenizers>=0.15,<0.16
-accelerate>=0.28,<1.0
+accelerate==1.9.0
 safetensors>=0.4.1,<0.6
 huggingface-hub>=0.20
 
