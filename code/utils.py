@@ -1,4 +1,5 @@
 import re
+import random
 
 def is_multiple_choice(question_text):
     lines = question_text.strip().split("\n")
@@ -47,7 +48,7 @@ def extract_answer_only(generated_text: str, original_question: str, prompt: str
         if match:
             return match.group(1)
         else:
-            return "0"
+            return str(random.randint(1, 5))
     else:
         # 주관식 답변은 그대로 반환 (기존 로직 유지)
         return text
