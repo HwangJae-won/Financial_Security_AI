@@ -3,7 +3,7 @@ from tqdm import tqdm
 from model import load_model
 from prompt import make_prompt_auto
 from utils import extract_answer_only
-
+import os
 
 from transformers import AutoTokenizer
 
@@ -46,6 +46,7 @@ def main():
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv(DATA_PATH + "sample_submission.csv")
     sample_submission['Answer'] = preds
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
     sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
     print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
 
