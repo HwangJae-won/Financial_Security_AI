@@ -5,11 +5,11 @@ from prompt import make_prompt_auto
 from utils import extract_answer_only
 import os
 
-from transformers import AutoTokenizer
+# from transformers import AutoTokenizer
 
 # tokenizer는 바깥에서 만든 걸 주입하세요.
 MODEL_NAME = "upstage/SOLAR-10.7B-Instruct-v1.0"
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 
 DATA_PATH = "data/"
