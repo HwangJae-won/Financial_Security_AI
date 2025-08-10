@@ -36,8 +36,12 @@ def main():
         # output = pipe(prompt, **gen_kwargs)
         print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text']}")  # 출력 일부
         pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
+        if pred_answer == '0' or pred_answer == '미응답':
+            output = pipe(prompt, max_new_tokens=256, temperature=0.5, top_p=0.95, do_sample)
+            pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
         print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
         preds.append(pred_answer)
+        
 
     print("\n✅ 추론 완료!")
     print(f"생성된 답변 개수: {len(preds)}")
