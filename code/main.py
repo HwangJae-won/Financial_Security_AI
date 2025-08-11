@@ -5,12 +5,6 @@ from prompt import make_prompt_auto
 from utils import extract_answer_only
 import os
 
-# from transformers import AutoTokenizer
-
-# tokenizer는 바깥에서 만든 걸 주입하세요.
-MODEL_NAME = "upstage/SOLAR-10.7B-Instruct-v1.0"
-# tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
 
 DATA_PATH = "data/"
 OUTPUT_PATH = "results/"
@@ -28,19 +22,57 @@ def main():
     preds = []
     print("🚀 추론 시작!")
     for idx, q in enumerate(tqdm(test['Question'], desc="Inference")):
-        prompt = make_prompt_auto(q, version = PROMPT_VERSION)
-        #prompt = make_prompt_fewshot(q)
-        # prompt, gen_kwargs = make_prompt_auto(q, tokenizer, version="v2")
-        print(f"\n[문항 {idx+1}] 프롬프트 생성 완료:\n{prompt[:100]}...")  # 프롬프트 일부 출력
-        output = pipe(prompt, max_new_tokens=256, temperature=0.2, top_p=0.9)
-        # output = pipe(prompt, **gen_kwargs)
-        print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text']}")  # 출력 일부
-        pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
-        if pred_answer == '0' or pred_answer == '미응답':
-            output = pipe(prompt, max_new_tokens=256, temperature=0.5, top_p=0.95, do_sample=True)
-            pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
-        print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
-        preds.append(pred_answer)
+        prompt = make_prompt_auto(q, version=PROMPT_VERSION)
+        stage_result = None  # 성공 단계 기록
+    
+        # 1) 1차: 보수적 (greedy)
+        out = pipe(prompt, max_new_tokens=256, temperature=0.0)  # do_sample=False(default)
+        raw = out[0]["generated_text"]
+        ans = extract_answer_only(raw, original_question=q, prompt=prompt)
+        if ans not in ("0", "미응답"):
+            stage_result = "1차 성공"
+        else:
+            print(f"\n[문항 {idx}] 1차 실패 → 샘플링(온건) 재시도")
+    
+        # 2) 실패면: 샘플링으로 여러 개 뽑아 유효한 것 고르기
+        if stage_result is None:
+            outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95,
+                num_return_sequences=3, repetition_penalty=1.05)
+            picked = None
+            for o in outs:
+                cand = extract_answer_only(o["generated_text"], original_question=q, prompt=prompt)
+                if cand not in ("0", "미응답"):
+                    picked = cand
+                    raw = o["generated_text"]
+                    break
+            if picked:
+                ans = picked
+                stage_result = "2차 성공"
+            else:
+                print(f"[문항 {idx}] 2차 실패 → 샘플링(넓게) 재시도")
+    
+        # 3) 그래도 실패면: 더 넓게 샘플링
+        if stage_result is None:
+            outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.8, top_p=1.0,
+                num_return_sequences=5, repetition_penalty=1.05)
+            picked = None
+            for o in outs:
+                cand = extract_answer_only(o["generated_text"], original_question=q, prompt=prompt)
+                if cand not in ("0", "미응답"):
+                    picked = cand
+                    raw = o["generated_text"]
+                    break
+            if picked:
+                ans = picked
+                stage_result = "3차 성공"
+            else:
+                ans = "0"  # 마지막 가드
+                stage_result = "실패"
+    
+        # 최종 결과 출력
+        print(f"\n[문항 {idx}] 단계 결과: {stage_result}")
+        print(f"[문항 {idx}] 최종 추출된 답변: {ans}")
+        preds.append(ans)
         
 
     print("\n✅ 추론 완료!")

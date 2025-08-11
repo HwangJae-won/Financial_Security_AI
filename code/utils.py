@@ -4,7 +4,7 @@ import random
 def is_multiple_choice(question_text):
     lines = question_text.strip().split("\n")
     option_count = sum(bool(re.match(r"^\s*[1-9][0-9]?\s", line)) for line in lines)
-    return option_count >= 2
+    return option_count >= 2, option_count
 
 def extract_question_and_choices(full_text):
     lines = full_text.strip().split("\n")
@@ -17,6 +17,7 @@ def extract_question_and_choices(full_text):
             q_lines.append(line.strip())
     question = " ".join(q_lines)
     return question, options
+    
 def extract_answer_only(generated_text: str, original_question: str, prompt: str) -> str:
     """
     - "답변:" 이후 텍스트만 추출
@@ -37,36 +38,22 @@ def extract_answer_only(generated_text: str, original_question: str, prompt: str
     
     # 3. 공백 또는 빈 문자열일 경우 기본값 지정
     if not text:
-        return "미응답"
+        text = "미응답"
 
     # 4. 객관식 여부 판단
-    is_mc = is_multiple_choice(original_question)
+    is_mc, option_count = is_multiple_choice(original_question)
 
     if is_mc:
         # 숫자만 추출 (기존 로직 유지)
         match = re.match(r"\D*([1-9][0-9]?)", text)
         if match:
-            return match.group(1)
+            num = int(match.group(1))
+            if 1 <= num <= option_count:   # 선택지 이상이면 무효 처리
+                return str(num)
+            else:
+                return '0'
         else:
-            return str(random.randint(1, 5))
+            return '0'
     else:
         # 주관식 답변은 그대로 반환 (기존 로직 유지)
         return text
-# def extract_answer_only(generated_text: str, original_question: str) -> str:
-#     if "답변:" in generated_text:
-#         text = generated_text.split("답변:")[-1].strip()
-#     else:
-#         text = generated_text.strip()
-#     if not text:
-#         return "미응답"
-#     is_mc = is_multiple_choice(original_question)
-#     if is_mc:
-#         match = re.match(r"\D*([1-9][0-9]?)", text)
-#         if match:
-#             return match.group(1)
-#         else:
-#             # 숫자가 없으면 첫 번째 선택지를 반환
-#             _, options = extract_question_and_choices(original_question)
-#             return options[0] if options else "미응답"
-#     else:
-#         return text
