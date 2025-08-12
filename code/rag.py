@@ -6,18 +6,17 @@
 - 질문 시 상위 k개 청크 검색 후, 컨텍스트를 포함한 프롬프트로 LLM 호출
 - 객관식/주관식 모두 지원(기존 utils.py의 is_multiple_choice, extract_question_and_choices 사용)
 
-필요 패키지:
-    pip install pdfplumber sentence-transformers faiss-cpu
-
 사용 예:
     # 1) 인덱스 빌드
-    python rag.py build --pdf ./data/전자금융거래법_제19734호.pdf
+    !python code/rag.py build --pdf "data/전자금융거래법(법률)(제19734호)(20240915).pdf"
 
     # 2) 단일 질문
-    python rag.py ask --question "전자금융거래법 제6조의 핵심은 무엇인가?"
+    !python code/rag.py ask --question "전자금융거래법 제6조의 핵심은 무엇인가?"
+    !python code/rag.py ask --question "전자금융업자가 전자금융거래법 제35조에 따라 겸업제한을 위반할 경우, 어떤 조치를 받을 수 있는가? 1 과태료 부과 2 형사처벌 3 영업정지 4 경고"
+
 
     # 3) test.csv 한 번에 추론(컬럼명: Question)
-    python rag.py run --csv ./data/test.csv
+    !python code/rag.py run --csv "data/test.csv"
 
 인덱스/메타는 ./rag_index/ 아래 저장됩니다.
 """
@@ -28,6 +27,7 @@ import json
 import argparse
 import pickle
 from typing import List, Tuple, Optional
+from tqdm import tqdm
 
 import numpy as np
 
@@ -39,19 +39,19 @@ import faiss
 
 # 기존 프로젝트 모듈
 from model import load_model
-from utils import is_multiple_choice, extract_question_and_choices
-from prompt import make_prompt_auto  # 필요시만 사용(우리는 전용 프롬프트도 제공)
+from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only
+from prompt import make_prompt_rag 
 
 
 # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
 class E5Embedder:
     """
-    intfloat/multilingual-e5-base 를 transformers로 직접 로드.
+    intfloat/multilingual-e5-small 를 transformers로 직접 로드.
     - query에는 'query: ' 프리픽스
     - passage에는 'passage: ' 프리픽스
     - mean-pooling + L2 normalize
     """
-    def __init__(self, model_name="intfloat/multilingual-e5-base", device=None):
+    def __init__(self, model_name="intfloat/multilingual-e5-small", device=None):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name)  # torch==2.1.0 안전
         self.model.eval()
@@ -92,11 +92,13 @@ class E5Embedder:
 INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
-MODEL_NAME = "intfloat/multilingual-e5-base"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 256        # 청크 길이(문자 수 기준)
-CHUNK_OVERLAP = 120     # 청크 겹침
+MODEL_NAME = "intfloat/multilingual-e5-small"   # 한글 안정: e5-base 다국어
+CHUNK_SIZE = 320        # 청크 길이(문자 수 기준)
+CHUNK_OVERLAP = 64     # 청크 겹침
 TOP_K = 3               # 검색 상위 k개
 
+SCORE_THRESHOLD = 0.9
+OUTPUT_PATH = "results/"
 # -----------------------------
 # 유틸
 # -----------------------------
@@ -178,6 +180,33 @@ class RAGIndexer:
             pickle.dump(meta, f)
         print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL}")
 
+    def build_many(self, pdf_path: List[str], index_dir=INDEX_DIR):
+        all_chucnks, all_sources = [], []
+        total = 0
+        print(f"📄 PDF 읽는 중: {pdf_path}")
+        raw = load_pdf_text(pdf_path)
+        if not raw.strip():
+            raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+
+        print("🔪 청크 분할 중...")
+        chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+        print(f"✅ 청크 개수: {len(chunks)}")
+
+        print(f"🧠 임베딩 계산({self.model_name})...")
+        vectors = self.embedder.encode_passages(chunks)
+        dim = vectors.shape[1]
+
+        print("📦 FAISS 인덱스 생성/저장...")
+        _ensure_dir(index_dir)
+        index = faiss.IndexFlatIP(dim)  # 내적(코사인 유사도는 정규화 완료 기준)
+        index.add(vectors)
+        faiss.write_index(index, INDEX_BIN)
+        meta = {"chunks": chunks, "model_name": self.model_name}
+        with open(META_PKL, "wb") as f:
+            pickle.dump(meta, f)
+        print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL}")
+
+
 class RAGRetriever:
     def __init__(self, index_dir=INDEX_DIR, device=None):
         if not (os.path.exists(INDEX_BIN) and os.path.exists(META_PKL)):
@@ -203,47 +232,19 @@ class RAGRetriever:
         return [self.chunks[i] for i, _ in hits]
 
 # -----------------------------
-# 프롬프트 생성 (RAG 전용)
-# -----------------------------
-def make_prompt_with_context(original_text: str, contexts: List[str]) -> str:
-    """
-    - 객관식: 기존 질문/선택지는 그대로 유지하고, 맨 아래에 [참고자료] 블록으로 컨텍스트 추가
-    - 주관식: 질문 아래에 [참고자료] 블록 추가
-    (주의) 질문 문자열 자체에 컨텍스트를 섞어 넣지 말아야 utils의 선택지 파서가 깨지지 않음.
-    """
-    context_block = "[참고자료]\n" + "\n\n---\n".join(contexts) if contexts else ""
-    is_mc, _ = is_multiple_choice(original_text)
-    if is_mc:
-        question, options = extract_question_and_choices(original_text)
-        role_instruction = "당신은 금융보안 전문가이자, 금융보안원 소속의 베테랑 연구원입니다. 한국어로 아래 지시를 따르세요."
-        prompt = (
-            f"{role_instruction}\n\n"
-            f"**지시:** 다음 질문은 객관식입니다. 참고자료를 바탕으로 **가장 적절한 정답 번호만** 출력하세요.\n\n"
-            f"질문: {question}\n"
-            "선택지:\n"
-            f"{chr(10).join(options)}\n\n"
-            f"{context_block}\n\n"
-            "답변:"
-        )
-        return prompt
-    else:
-        role_instruction = "당신은 금융보안 전문가이자, 금융보안원 소속의 베테랑 연구원입니다. 한국어로 아래 지시를 따르세요."
-        prompt = (
-            f"{role_instruction}\n\n"
-            f"**지시:** 참고자료의 원문을 절대 그대로 복사하지 말고, 질문에 맞는 핵심 내용을 3문장 이내로 요약·재구성하세요. 불필요한 세부사항은 생략하고, 핵심 키워드만 포함하세요.\n\n"
-            f"질문: {original_text}\n\n"
-            f"{context_block}\n\n"
-            "답변:"
-        )
-        return prompt
-
-# -----------------------------
 # RAG 추론 함수
 # -----------------------------
-def answer_with_rag(question: str, retriever: RAGRetriever, pipe, top_k=TOP_K):
+def answer_with_rag(
+    question: str, retriever: RAGRetriever, pipe, top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD):
     hits = retriever.search(question, top_k=top_k)
     passages = retriever.get_passages(hits)
-    prompt = make_prompt_with_context(question, passages)
+    top_score = hits[0][1] if hits else 0.0
+
+    # --- 핵심: 점수 낮으면 컨텍스트 제거 ---
+    use_context = (top_score >= score_threshold)
+    contexts = passages if use_context else []
+
+    prompt = make_prompt_rag(question, contexts, use_fewshot=True)
 
     # 너 환경의 decode 정책 맞춤: 1차 greedy → 실패 시 샘플링
     out = pipe(prompt, max_new_tokens=128, temperature=0.0)
@@ -258,7 +259,7 @@ def answer_with_rag(question: str, retriever: RAGRetriever, pipe, top_k=TOP_K):
         if not m:
             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
-    return prompt, gen, passages, hits
+    return prompt, gen, passages, hits, use_context
 
 # -----------------------------
 # CLI
@@ -272,14 +273,19 @@ def cmd_ask(args):
     pipe = load_model()
     retr = RAGRetriever(INDEX_DIR, device="cpu")
     q = args.question
-    prompt, gen, passages, hits = answer_with_rag(q, retr, pipe, top_k=args.top_k)
-    print("\n===== 프롬프트 (앞부분) =====")
-    print(prompt[:500] + "...")
+    prompt, gen, passages, hits, use_context = answer_with_rag(
+        q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
     print("\n===== 생성된 답변 =====")
     print(gen)
-    print("\n===== 참고된 청크 (점수순) =====")
-    for (idx, score), p in zip(hits, passages):
-        print(f"\n[score={score:.3f}] chunk#{idx}\n{p[:400]}...")
+    print("\n===== 검색 결과 요약 =====")
+    if hits:
+        print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
+    else:
+        print("검색 결과 없음 | context_used=False")
+    if use_context:
+        print("\n===== 참고된 청크 (점수순) =====")
+        for (idx, score), p in zip(hits, passages):
+            print(f"\n[score={score:.3f}] chunk#{idx}\n{p[:400]}...")
 
 def cmd_run(args):
     import pandas as pd
@@ -287,20 +293,31 @@ def cmd_run(args):
     retr = RAGRetriever(INDEX_DIR, device="cpu")
     df = pd.read_csv(args.csv)
     preds = []
-    for i, q in enumerate(df["Question"]):
-        prompt, gen, passages, hits = answer_with_rag(q, retr, pipe, top_k=args.top_k)
-        # 기존 파이프라인의 extract_answer_only를 재사용하고 싶다면:
-        from utils import extract_answer_only  # <- 프로젝트 경로에 맞게 수정 or 직접 구현
-        # 여기서는 간단히 원문 gen을 그대로 저장(후처리는 기존 코드에 맞춰 적용 권장)
-        preds.append(gen)
+    for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
+        prompt, gen, passages, hits, use_context = answer_with_rag(
+            q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
+        print(f"\n===== [문항{idx}] 생성된 답변 =====")
+        print(gen)
+        if hits:
+            print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
+        else:
+            print("검색 결과 없음 | context_used=False")
+        ans = extract_answer_only(gen, original_question=q, prompt=prompt)
+        preds.append(ans)
         if args.verbose and i < 5:
             print(f"\n[#{i}] Q={q[:80]}...")
+            print(f"[use_context={use_context}] top1={hits[0][1] if hits else None}")
             print(f"[gen] {gen[:200]}...")
 
-    out_csv = os.path.splitext(args.csv)[0] + "_rag_output.csv"
-    df["RAG_Generation"] = preds
-    df.to_csv(out_csv, index=False, encoding="utf-8-sig")
-    print(f"\n✅ 저장 완료: {out_csv}")
+    
+    experiment_name = "result.csv"
+    print("📄 제출 파일 생성 중...")
+    sample_submission = pd.read_csv("data/sample_submission.csv")
+    sample_submission['Answer'] = preds
+    os.makedirs(OUTPUT_PATH, exist_ok=True)
+    sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
+    print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
+    
 
 def main():
     parser = argparse.ArgumentParser(description="RAG for 전자금융거래법")
@@ -313,12 +330,14 @@ def main():
     p_ask = sub.add_parser("ask", help="단일 질문에 RAG 적용")
     p_ask.add_argument("--question", required=True, help="질문 텍스트")
     p_ask.add_argument("--top_k", type=int, default=TOP_K)
+    p_ask.add_argument("--threshold", type=float, default=SCORE_THRESHOLD, help="컨텍스트 사용 점수 임계값")
     p_ask.set_defaults(func=cmd_ask)
 
     p_run = sub.add_parser("run", help="CSV(Question 컬럼) 일괄 추론")
     p_run.add_argument("--csv", required=True, help="CSV 경로 (Question 컬럼 필요)")
     p_run.add_argument("--top_k", type=int, default=TOP_K)
     p_run.add_argument("--verbose", action="store_true")
+    p_run.add_argument("--threshold", type=float, default=SCORE_THRESHOLD, help="컨텍스트 사용 점수 임계값")
     p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()
