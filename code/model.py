@@ -11,7 +11,7 @@ def load_model():
         MODEL_NAME,
         device_map="auto",
         torch_dtype=torch.float16,
-        cache_dir=cache_dir_path
+        cache_dir=cache_dir_path,
     )
     pipe = pipeline(
         "text-generation",
