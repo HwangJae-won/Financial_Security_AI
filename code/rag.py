@@ -13,6 +13,7 @@
     # 2) 단일 질문
     !python code/rag.py ask --question "전자금융거래법 제6조의 핵심은 무엇인가?"
     !python code/rag.py ask --question "전자금융업자가 전자금융거래법 제35조에 따라 겸업제한을 위반할 경우, 어떤 조치를 받을 수 있는가? 1 과태료 부과 2 형사처벌 3 영업정지 4 경고"
+    !python code/rag.py ask --question $'전자서명법 제22조에 따른 분쟁 조정의 주체로 올바른 것은?\n1 한국인터넷진흥원\n2 과학기술정보통신부\n3 금융감독원\n4 개인정보보호위원회'
 
 
     # 3) test.csv 한 번에 추론(컬럼명: Question)
