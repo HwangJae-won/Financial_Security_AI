@@ -115,9 +115,9 @@ def make_prompt_rag(
             role
             + "**지시:** [예시]와 같이 [질문]에 대한 답변을 [참고자료]를 바탕으로 도출하세요.  "
               " 그 다음 줄에 가장 적절한 **답변: <번호 1개만>** 출력하세요.\n\n"
-            + fewshot_block_mc
             + f"[질문]: {q}\n선택지:\n{chr(10).join(opts)}\n\n"
             + context_block
+            + fewshot_block_mc
             + "\n답변:"
         )
     else:
@@ -125,9 +125,9 @@ def make_prompt_rag(
             role
             + "**지시:** 참고자료의 원문을 그대로 복사하지 말고, 질문에 맞는 핵심 내용을 3문장 이내로 요약·재구성하세요. "
               "가능하면 참고자료에서 **정확한 용어 한두 개**를 포함하세요. 답변은 한국어로 작성하세요.\n\n"
-            + fewshot_block
             + f"질문: {text}\n\n"
             + context_block
+            + fewshot_block
             + "답변:"
         )
 
