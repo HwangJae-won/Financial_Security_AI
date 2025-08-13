@@ -142,6 +142,7 @@ def load_pdf_text(pdf_path: str) -> str:
             texts.append(t)
     return "\n".join(texts)
 
+
 # -----------------------------
 # 인덱서/검색기
 # -----------------------------
@@ -269,7 +270,7 @@ def answer_with_rag(
             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
             if cand not in ("0", "미응답"):
                 picked = cand
-                geb = o["generated_text"]
+                gen = o["generated_text"]
                 break
 
     # 간단 후처리(필요시 강화)
@@ -282,6 +283,7 @@ def answer_with_rag(
             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
     return prompt, gen, passages, hits, use_context
+
 
 # -----------------------------
 # CLI
@@ -335,6 +337,7 @@ def cmd_run(args):
         else:
             print("검색 결과 없음 | context_used=False")
         ans = extract_answer_only(gen, original_question=q, prompt=prompt)
+        
         preds.append(ans)
         if args.verbose and i < 5:
             print(f"\n[#{i}] Q={q[:80]}...")
