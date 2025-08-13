@@ -1,25 +1,22 @@
 # rag.py
 # -*- coding: utf-8 -*-
 """
-전자금융거래법 PDF를 RAG로 활용하는 모듈/스크립트.
 - PDF → 텍스트 청크 → 임베딩 → FAISS 인덱스 생성/저장
 - 질문 시 상위 k개 청크 검색 후, 컨텍스트를 포함한 프롬프트로 LLM 호출
-- 객관식/주관식 모두 지원(기존 utils.py의 is_multiple_choice, extract_question_and_choices 사용)
 
 사용 예:
     # 1) 인덱스 빌드
     !python code/rag.py build --pdf "data/전자금융거래법(법률)(제19734호)(20240915).pdf"
+    !python code/rag.py build --dir "laws/"
 
     # 2) 단일 질문
     !python code/rag.py ask --question "전자금융거래법 제6조의 핵심은 무엇인가?"
     !python code/rag.py ask --question "전자금융업자가 전자금융거래법 제35조에 따라 겸업제한을 위반할 경우, 어떤 조치를 받을 수 있는가? 1 과태료 부과 2 형사처벌 3 영업정지 4 경고"
     !python code/rag.py ask --question $'전자서명법 제22조에 따른 분쟁 조정의 주체로 올바른 것은?\n1 한국인터넷진흥원\n2 과학기술정보통신부\n3 금융감독원\n4 개인정보보호위원회'
 
-
     # 3) test.csv 한 번에 추론(컬럼명: Question)
     !python code/rag.py run --csv "data/test.csv"
 
-인덱스/메타는 ./rag_index/ 아래 저장됩니다.
 """
 
 import os
@@ -94,9 +91,9 @@ INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "intfloat/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 320        # 청크 길이(문자 수 기준)
-CHUNK_OVERLAP = 64     # 청크 겹침
-TOP_K = 3               # 검색 상위 k개
+CHUNK_SIZE = 480        # 청크 길이(문자 수 기준)
+CHUNK_OVERLAP = 80     # 청크 겹침
+TOP_K = 1               # 검색 상위 k개
 
 SCORE_THRESHOLD = 0.9
 OUTPUT_PATH = "results/"
@@ -148,64 +145,57 @@ def load_pdf_text(pdf_path: str) -> str:
 # -----------------------------
 # 인덱서/검색기
 # -----------------------------
+
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
         self.model_name = model_name
         self.embedder = E5Embedder(model_name, device='cpu')
 
-    def encode(self, texts: List[str]) -> np.ndarray:
-        emb = self.embedder.encode(texts, batch_size=64, show_progress_bar=True, normalize_embeddings=True)
-        return emb.astype("float32")
-
-    def build(self, pdf_path: str, index_dir=INDEX_DIR):
-        print(f"📄 PDF 읽는 중: {pdf_path}")
-        raw = load_pdf_text(pdf_path)
-        if not raw.strip():
-            raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
-
-        print("🔪 청크 분할 중...")
-        chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
-        print(f"✅ 청크 개수: {len(chunks)}")
-
-        print(f"🧠 임베딩 계산({self.model_name})...")
-        vectors = self.embedder.encode_passages(chunks)
-        dim = vectors.shape[1]
-
-        print("📦 FAISS 인덱스 생성/저장...")
-        _ensure_dir(index_dir)
-        index = faiss.IndexFlatIP(dim)  # 내적(코사인 유사도는 정규화 완료 기준)
-        index.add(vectors)
-        faiss.write_index(index, INDEX_BIN)
-        meta = {"chunks": chunks, "model_name": self.model_name}
-        with open(META_PKL, "wb") as f:
-            pickle.dump(meta, f)
-        print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL}")
-
-    def build_many(self, pdf_path: List[str], index_dir=INDEX_DIR):
-        all_chucnks, all_sources = [], []
+    def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
+        all_chunks, all_sources = [], []
         total = 0
-        print(f"📄 PDF 읽는 중: {pdf_path}")
-        raw = load_pdf_text(pdf_path)
-        if not raw.strip():
-            raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+        for pdf_path in pdf_paths:
+            print(f"📄 PDF 읽는 중: {pdf_path}")
+            raw = load_pdf_text(pdf_path)
+            if not raw.strip():
+                raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+            print("🔪 청크 분할 중...")
+            chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+            all_chunks.extend(chunks)
+            all_sources.extend([os.path.basename(pdf_path)] * len(chunks))
+            total += len(chunks)
+            print(f"  → {os.path.basename(pdf_path)}: {len(chunks)}개")
+        
+        if total == 0:
+            raise ValueError("인덱싱할 청크가 없습니다.")
 
-        print("🔪 청크 분할 중...")
-        chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
-        print(f"✅ 청크 개수: {len(chunks)}")
-
-        print(f"🧠 임베딩 계산({self.model_name})...")
-        vectors = self.embedder.encode_passages(chunks)
+        print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
+        vectors = self.embedder.encode_passages(all_chunks)
+        if vectors.shape[0] != len(all_chunks):
+            raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
         dim = vectors.shape[1]
 
         print("📦 FAISS 인덱스 생성/저장...")
         _ensure_dir(index_dir)
-        index = faiss.IndexFlatIP(dim)  # 내적(코사인 유사도는 정규화 완료 기준)
+        index = faiss.IndexFlatIP(dim)  # 내적(코사인; 임베딩 L2 정규화 가정)
         index.add(vectors)
-        faiss.write_index(index, INDEX_BIN)
-        meta = {"chunks": chunks, "model_name": self.model_name}
-        with open(META_PKL, "wb") as f:
+
+        # 원자적 저장(권장)
+        tmp_idx = INDEX_BIN + ".tmp"
+        tmp_meta = META_PKL + ".tmp"
+        faiss.write_index(index, tmp_idx)
+        meta = {
+            "chunks": all_chunks,
+            "sources": all_sources,
+            "model_name": self.model_name,
+            "n_vectors": int(vectors.shape[0]),
+        }
+        with open(tmp_meta, "wb") as f:
             pickle.dump(meta, f)
-        print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL}")
+        os.replace(tmp_idx, INDEX_BIN)
+        os.replace(tmp_meta, META_PKL)
+
+        print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
 
 
 class RAGRetriever:
@@ -215,22 +205,42 @@ class RAGRetriever:
         self.index = faiss.read_index(INDEX_BIN)
         with open(META_PKL, "rb") as f:
             meta = pickle.load(f)
-        self.chunks = meta["chunks"]
+        self.chunks = list(meta["chunks"])
+        self.sources = list(meta.get("sources", ["unknown"] * len(self.chunks)))
         self.model_name = meta.get("model_name", MODEL_NAME)
+        self._n_meta = len(self.chunks)
+        self._n_index = int(self.index.ntotal)
+        # 불일치 보정(더 작은 쪽으로 자르기)
+        expect = int(meta.get("n_vectors", self._n_meta))
+        if expect != self._n_index or self._n_meta != self._n_index:
+            print(f"⚠️ meta/Index 불일치. meta.chunks={self._n_meta}, meta.n_vectors={expect}, index.ntotal={self._n_index}. "
+                  f"{min(self._n_meta, self._n_index)}개로 보정합니다.")
+            n = min(self._n_meta, self._n_index)
+            self.chunks = self.chunks[:n]
+            self.sources = self.sources[:n]
+            self._n_meta = n
+            self._n_index = n
 
         # 검색시 사용할 동일 임베더 로드
         self.embedder = E5Embedder(self.model_name, device='cpu')
 
     def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
         q_emb = self.embedder.encode_queries([query]).astype("float32")
-        D, I = self.index.search(q_emb, top_k)
-        results = []
-        for idx, score in zip(I[0].tolist(), D[0].tolist()):
-            results.append((idx, float(score)))
+        k = min(int(top_k), self._n_index) if self._n_index > 0 else 0
+        if k <= 0:
+            return []
+        D, I = self.index.search(q_emb, k)
+        raw = list(zip(I[0].tolist(), D[0].tolist()))
+        # 유효 인덱스만 필터(-1/범위 초과 제거)
+        results = [(idx, float(score)) for idx, score in raw if (0 <= idx < self._n_meta)]
         return results
 
     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.chunks[i] for i, _ in hits]
+
+    def get_sources(self, hits: List[Tuple[int, float]]) -> List[str]:
+        return [self.sources[i] for i, _ in hits]
+
 
 # -----------------------------
 # RAG 추론 함수
@@ -248,8 +258,19 @@ def answer_with_rag(
     prompt = make_prompt_rag(question, contexts, use_fewshot=True)
 
     # 너 환경의 decode 정책 맞춤: 1차 greedy → 실패 시 샘플링
-    out = pipe(prompt, max_new_tokens=128, temperature=0.0)
+    out = pipe(prompt, max_new_tokens=256, temperature=0.0)
     gen = out[0]["generated_text"]
+    ans = extract_answer_only(gen, original_question=question, prompt=prompt)
+    if ans in ("0", "미응답"):
+        outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95,
+                    num_return_sequences=3, repetition_penalty=1.05)
+        picked = None
+        for o in outs:
+            cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
+            if cand not in ("0", "미응답"):
+                picked = cand
+                geb = o["generated_text"]
+                break
 
     # 간단 후처리(필요시 강화)
     # 객관식이면 숫자만, 주관식이면 문장 정리
@@ -268,7 +289,16 @@ def answer_with_rag(
 def cmd_build(args):
     _ensure_dir(INDEX_DIR)
     indexer = RAGIndexer(MODEL_NAME, device="cpu")
-    indexer.build(args.pdf, INDEX_DIR)
+    pdfs = []
+    if args.pdf:
+        pdfs.extend(args.pdf)
+    if args.dir:
+        for name in os.listdir(args.dir):
+            if name.lower().endswith(".pdf"):
+                pdfs.append(os.path.join(args.dir, name))
+    if not pdfs:
+        raise ValueError("PDF가 없습니다. --pdf 다중 또는 --dir를 지정하세요.")
+    indexer.build_many(pdfs, INDEX_DIR)
 
 def cmd_ask(args):
     pipe = load_model()
@@ -284,9 +314,10 @@ def cmd_ask(args):
     else:
         print("검색 결과 없음 | context_used=False")
     if use_context:
+        srcs = retr.get_sources(hits)
         print("\n===== 참고된 청크 (점수순) =====")
-        for (idx, score), p in zip(hits, passages):
-            print(f"\n[score={score:.3f}] chunk#{idx}\n{p[:400]}...")
+        for (idx, score), p, s in zip(hits, passages, srcs):
+            print(f"\n[score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
 
 def cmd_run(args):
     import pandas as pd
@@ -324,8 +355,9 @@ def main():
     parser = argparse.ArgumentParser(description="RAG for 전자금융거래법")
     sub = parser.add_subparsers()
 
-    p_build = sub.add_parser("build", help="PDF에서 인덱스 생성")
-    p_build.add_argument("--pdf", required=True, help="PDF 파일 경로")
+    p_build = sub.add_parser("build", help="PDF에서 인덱스 생성(여러 개 가능)")
+    p_build.add_argument("--pdf", nargs="+", help="PDF 파일 경로(공백으로 여러 개)")
+    p_build.add_argument("--dir", help="PDF 폴더 경로(내부 *.pdf 일괄)")
     p_build.set_defaults(func=cmd_build)
 
     p_ask = sub.add_parser("ask", help="단일 질문에 RAG 적용")
