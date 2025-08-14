@@ -5,26 +5,24 @@ import os
 # --- 진짜 문제 해결을 위한 핵심 코드 ---
 
 # 1. 공간이 넉넉한 /workspace 내에 캐시 및 임시 폴더 경로를 지정합니다.
-CACHE_DIR = "/workspace/huggingface_cache"
-TMP_DIR = "/workspace/tmp"
+CACHE_DIR = "/dev/shm/huggingface_cache"
+
 
 # 2. 모든 라이브러리가 이 경로를 사용하도록 '환경 변수'를 설정합니다.
 #    이 작업은 다른 어떤 코드보다 먼저 실행되어야 합니다.
 os.environ['HF_HOME'] = CACHE_DIR
 os.environ['HUGGINGFACE_HUB_CACHE'] = CACHE_DIR
-os.environ['TMPDIR'] = TMP_DIR
-os.environ['TEMP'] = TMP_DIR
-os.environ['TMP'] = TMP_DIR
+
 
 # 3. 스크립트 실행 시 해당 폴더들이 존재하도록 생성해줍니다.
 os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs(TMP_DIR, exist_ok=True)
+
 
 print(f"✅ Hugging Face 캐시 폴더가 다음으로 설정되었습니다: {os.environ.get('HF_HOME')}")
 print(f"✅ 임시 파일 폴더가 다음으로 설정되었습니다: {os.environ.get('TMPDIR')}")
 
 
-MODEL_NAME = "upstage/SOLAR-10.7B-Instruct-v1.0"
+MODEL_NAME = "VIRNECT/llama-3-Korean-8B"
 
 def load_model():
     """
@@ -33,8 +31,7 @@ def load_model():
     """
     print(f"Tokenizer를 로딩합니다: {MODEL_NAME}")
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        cache_dir=CACHE_DIR
+        MODEL_NAME
     )
     
     print(f"Model을 로딩합니다: {MODEL_NAME}")
