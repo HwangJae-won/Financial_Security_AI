@@ -2,7 +2,7 @@ import pandas as pd
 
 # CSV 불러오기
 sample_df = pd.read_csv("data/sample.csv")  # ID, 정답
-submission_df = pd.read_csv("results/rag_submission.csv")  # ID, Answer
+submission_df = pd.read_csv("results/rag_pdf_solar.csv")  # ID, Answer
 
 # ID 기준으로 병합
 merged = pd.merge(sample_df, submission_df, on="ID", how="inner")
@@ -17,5 +17,6 @@ merged["정답여부"] = merged.apply(
 print(merged)
 
 # 정답률 계산
+print("정답개수:", merged["정답여부"].sum())
 accuracy = merged["정답여부"].mean() * 100
 print(f"정답률: {accuracy:.2f}%")
