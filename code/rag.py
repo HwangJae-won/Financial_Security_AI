@@ -38,7 +38,7 @@ import faiss
 # 기존 프로젝트 모듈
 from model import load_model
 from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only
-from prompt import make_prompt_rag 
+from prompt import make_prompt_rag_exaone 
 
 
 # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
@@ -256,15 +256,23 @@ def answer_with_rag(
     use_context = (top_score >= score_threshold)
     contexts = passages if use_context else []
 
-    prompt = make_prompt_rag(question, contexts, use_fewshot=True)
+    prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
 
     # 너 환경의 decode 정책 맞춤: 1차 greedy → 실패 시 샘플링
-    out = pipe(prompt, max_new_tokens=256, temperature=0.0)
+    is_mc, mc_num = is_multiple_choice(question)
+    if is_mc:
+        out = pipe(prompt, max_new_tokens=2, do_sample=False)
+    else:
+        out = pipe(prompt, max_new_tokens=256, do_sample=False)
     gen = out[0]["generated_text"]
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
     if ans in ("0", "미응답"):
-        outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95,
-                    num_return_sequences=3, repetition_penalty=1.05)
+        if is_mc:
+            outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95, 
+                        num_return_sequences=3, repetition_penalty=1.05)
+        else:
+            outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95, 
+                        num_return_sequences=3, repetition_penalty=1.05)
         picked = None
         for o in outs:
             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
