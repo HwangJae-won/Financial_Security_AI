@@ -2,7 +2,7 @@ import pandas as pd
 
 # CSV 불러오기
 sample_df = pd.read_csv("data/sample.csv")  # ID, 정답
-submission_df = pd.read_csv("results/rag_pdf_solar.csv")  # ID, Answer
+submission_df = pd.read_csv("results/solar_more_large_model_rag.csv")  # ID, Answer
 
 # ID 기준으로 병합
 merged = pd.merge(sample_df, submission_df, on="ID", how="inner")
