@@ -1,70 +1,62 @@
+import sys
+import os
 import pandas as pd
 from tqdm import tqdm
-from model import load_model
-from prompt import make_prompt_fewshot
-from utils import extract_answer_only
-
-DATA_PATH = "data/"
-OUTPUT_PATH = "results/"
-PROMPT_FUNC = make_prompt_fewshot 
+from rag import setup_retriever
+from model import setup_model
+from utils import extract_answer_only, is_multiple_choice
+from prompt import make_prompt_rag_solar
+from config import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH
 
 def main():
-    print("📂 테스트 데이터 로딩 중...")
-    test = pd.read_csv(DATA_PATH + 'test.csv')
-    print(f"✅ 테스트 데이터 로드 완료! 총 문항 수: {len(test)}")
+    print("--- Financial Security AI Model Started---")   
+    retriever = setup_retriever(folder_path=LAW_PATH)
+    llm = setup_model()
+    print("--- ✅ RAG 및 LLM 초기 설정 완료 ---\n")
 
-    print("🧠 모델 로딩 중...")
-    pipe = load_model()
-    print("✅ 모델 로딩 완료!")
+    print("---  테스트 데이터 로딩 시작 ---")
+    test_df = pd.read_csv(os.path.join(DATA_PATH, 'test.csv'))
+    print(f"✅ 테스트 데이터 로드 완료, 총 문항 수: {len(test_df)}\n")
 
+    print("--- RAG 기반 추론 시작 ---")
     preds = []
-    print("🚀 추론 시작!")
-    for idx, q in enumerate(tqdm(test['Question'], desc="Inference")):
-        prompt = PROMPT_FUNC(q)
-        print(f"\n[문항 {idx+1}] 프롬프트 생성 완료:\n{prompt[:100]}...")  # 프롬프트 일부 출력
-        output = pipe(prompt, max_new_tokens=256, temperature=0.3, top_p=0.9)
-        print(f"[문항 {idx+1}] 모델 출력:\n{output[0]['generated_text'][:100]}...")  # 출력 일부
-        pred_answer = extract_answer_only(output[0]["generated_text"], original_question=q, prompt=prompt)
-        print(f"[문항 {idx+1}] 추출된 답변: {pred_answer}")
-        preds.append(pred_answer)
+    USE_FEWSHOT = True 
+    for index, row in tqdm(test_df.iterrows(), total=len(test_df), desc="RAG 추론 진행"):
+        question = row['Question']
+        retrieved_docs = retriever.invoke(question)
+        
+        # retrieved_docs에서 page_content만 추출하여 리스트로 만듭니다.
+        contexts_list = [doc.page_content for doc in retrieved_docs]
+        
+        prompt = make_prompt_rag_solar(
+            text=question,          # 첫 번째 인자로 질문 텍스트
+            contexts=contexts_list, # 두 번째 인자로 컨텍스트 리스트
+            use_fewshot=USE_FEWSHOT # 세 번째 인자로 Few-shot 사용 여부
+        )
+        
+        answer_text = llm.invoke(prompt)
+        
+        final_answer = extract_answer_only(
+            generated_text=f"답변:{answer_text}",
+            original_question=question,
+            prompt=prompt 
+        )
+        preds.append(final_answer)
 
-    print("\n✅ 추론 완료!")
-    print(f"생성된 답변 개수: {len(preds)}")
-    
-    experiment_name = "solar_postcessing.csv"
-    print("📄 제출 파일 생성 중...")
-    sample_submission = pd.read_csv(DATA_PATH + "sample_submission.csv")
-    sample_submission['Answer'] = preds
-    sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
-    print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
+    print("--- ✅ RAG 기반 추론 완료 ---\n")
+
+    print("--- 제출 파일 생성 시작 ---")
+    OUTPUT_PATH = "results/"
+    if not os.path.exists(OUTPUT_PATH):
+        os.makedirs(OUTPUT_PATH)
+        
+    submission_df = pd.read_csv(os.path.join(DATA_PATH, "sample_submission.csv"))
+    submission_df['Answer'] = preds
+    submission_df.to_csv(os.path.join(OUTPUT_PATH, "solar_more_large_model_rag.csv"), index=False, encoding='utf-8-sig')
+    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'solar_more_large_model_rag.csv')}")
+    print("--- ✅ 모든 작업 완료 ---")
+
 
 if __name__ == "__main__":
-    print("=== 금융보안 AI 추론 파이프라인 시작 ===")
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     main()
-    print("=== 모든 작업 완료 ===")
-
-
-    # BATCH_SIZE = 8
-    # preds = []
-    # prompts = [PROMPT_FUNC(q) for q in tqdm(test['Question'], desc="프롬프트 생성")]
-    # batches = [prompts[i:i + BATCH_SIZE] for i in range(0, len(prompts), BATCH_SIZE)]
-
-    # with tqdm(batches, desc="추론 진행") as pbar:
-    #     for batch_prompts in pbar:
-    #         outputs = pipe(
-    #             batch_prompts,
-    #             max_new_tokens=128,
-    #             temperature=0.2,
-    #             top_p=0.9,
-    #             batch_size=BATCH_SIZE
-    #         )
-    #         for i, batch_output in enumerate(outputs):
-    #             output_text = batch_output[0]["generated_text"]
-    #             current_question_index = (pbar.n - 1) * BATCH_SIZE + i
-    #             original_question = test['Question'].iloc[current_question_index]
-    #             pred_answer = extract_answer_only(output_text, original_question=original_question)
-    #             preds.append(pred_answer)
-
-    # print("\n✅ 추론 완료!")
-    # print(f"생성된 답변 개수: {len(preds)}")
-    
