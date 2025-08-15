@@ -2,7 +2,7 @@ import sys
 import os
 import pandas as pd
 from tqdm import tqdm
-from rag import setup_retriever
+from rag import setup_retriever, rerank_documents 
 from model import setup_model
 from utils import extract_answer_only, is_multiple_choice
 from prompt import make_prompt_rag_solar
@@ -23,17 +23,23 @@ def main():
     USE_FEWSHOT = True 
     for index, row in tqdm(test_df.iterrows(), total=len(test_df), desc="RAG 추론 진행"):
         question = row['Question']
+
+        # 1차 검색 (더 많은 후보군을 얻기 위해 k값을 10~20으로 설정하는 것이 좋습니다.)
         retrieved_docs = retriever.invoke(question)
-        
-        # retrieved_docs에서 page_content만 추출하여 리스트로 만듭니다.
-        contexts_list = [doc.page_content for doc in retrieved_docs]
-        
+
+        # 2. 재순위화 모듈을 사용하여 문서의 순위를 재조정합니다.
+        # 최종적으로 상위 5개의 문서만 사용하도록 k=5 설정
+        reranked_docs = rerank_documents(question, retrieved_docs, k=5) 
+
+        # 재순위화된 문서들을 컨텍스트로 사용
+        contexts_list = [doc.page_content for doc in reranked_docs]
+
         prompt = make_prompt_rag_solar(
-            text=question,          # 첫 번째 인자로 질문 텍스트
-            contexts=contexts_list, # 두 번째 인자로 컨텍스트 리스트
-            use_fewshot=USE_FEWSHOT # 세 번째 인자로 Few-shot 사용 여부
+            text=question,
+            contexts=contexts_list,
+            use_fewshot=True
         )
-        
+
         answer_text = llm.invoke(prompt)
         
         final_answer = extract_answer_only(
@@ -52,7 +58,7 @@ def main():
         
     submission_df = pd.read_csv(os.path.join(DATA_PATH, "sample_submission.csv"))
     submission_df['Answer'] = preds
-    submission_df.to_csv(os.path.join(OUTPUT_PATH, "solar_more_large_model_rag.csv"), index=False, encoding='utf-8-sig')
+    submission_df.to_csv(os.path.join(OUTPUT_PATH, "pdf_mudlue_change_processing.csv"), index=False, encoding='utf-8-sig')
     print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'solar_more_large_model_rag.csv')}")
     print("--- ✅ 모든 작업 완료 ---")
 

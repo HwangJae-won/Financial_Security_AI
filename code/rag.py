@@ -69,3 +69,38 @@ def setup_retriever(folder_path="data/laws/"):
     print("✅ 벡터 스토어 생성 완료.")
     
     return vectorstore.as_retriever()
+
+from sentence_transformers.cross_encoder import CrossEncoder
+
+def rerank_documents(question, documents, k: int = 5):
+    """
+    RAG 시스템에서 검색된 문서들을 질문과의 관련성을 기준으로 재순위화합니다.
+    - question: 사용자 질문
+    - documents: 검색 모듈에서 반환된 문서 목록
+    - k: 최종적으로 반환할 상위 문서의 개수
+    """
+    if not documents:
+        print("경고: 재순위화할 문서가 없습니다.")
+        return []
+
+    print(f"🔍 {len(documents)}개의 문서를 재순위화합니다...")
+
+    # 재순위화 모델 로딩 (CrossEncoder 모델 사용)
+    # 이 모델은 질문-문서 쌍의 관련성 점수를 매기는 데 특화되어 있습니다.
+    reranker = CrossEncoder('cross-encoder/ms-marco-TinyBERT-L-2')
+    
+    # 질문과 각 문서의 내용을 쌍으로 만들어 리스트를 생성
+    pairs = [[question, doc.page_content] for doc in documents]
+    
+    # 모델을 사용하여 각 쌍에 대한 점수를 예측
+    scores = reranker.predict(pairs)
+    
+    # 점수와 문서를 튜플로 묶은 후, 점수 기준으로 내림차순 정렬
+    scored_documents = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+    
+    print("✅ 재순위화 완료. 상위 K개 문서 반환.")
+    
+    # 상위 k개 문서만 반환
+    reranked_docs = [doc for score, doc in scored_documents[:k]]
+    
+    return reranked_docs
