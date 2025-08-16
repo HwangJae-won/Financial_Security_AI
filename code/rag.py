@@ -11,8 +11,9 @@
 
     # 2) 단일 질문
     !python code/rag.py ask --question "전자금융거래법 제6조의 핵심은 무엇인가?"
-    !python code/rag.py ask --question "전자금융업자가 전자금융거래법 제35조에 따라 겸업제한을 위반할 경우, 어떤 조치를 받을 수 있는가? 1 과태료 부과 2 형사처벌 3 영업정지 4 경고"
-    !python code/rag.py ask --question $'전자서명법 제22조에 따른 분쟁 조정의 주체로 올바른 것은?\n1 한국인터넷진흥원\n2 과학기술정보통신부\n3 금융감독원\n4 개인정보보호위원회'
+    !python code/rag.py ask --question $'전자금융거래법 제44조에 따르면, 청문 절차가 필요한 경우는 무엇인가?\n1 전자금융거래의 중단\n2 전자금융거래의 보안 점검\n3 전자금융업자의 등록 취소\n4 전자금융거래의 수수료 변경'
+    !python code/rag.py ask --question $'국내대리인이 법을 위반한 경우, 그 책임은 누구에게 있는가?\n1 국내대리인\n2 정부기관\n3 법원\n4 정보통신서비스 제공자\n5 개인정보 처리 위탁업체'
+    !python code/rag.py ask --question $'개인정보보호법 제63조에 따르면, 보호위원회가 자료제출 요구 및 검사를 통해 수집한 서류나 자료를 제3자에게 제공하거나 일반에 공개할 수 있는 경우는?\n1 자료가 비밀이 아닌 경우\n2 개인정보처리자의 동의가 있는 경우\n3 정보주체가 개인정보 열람을 요청한 경우\n4 법에 따른 경우\n5 보호위원회의 내부 규정에 따른 경우'
 
     # 3) test.csv 한 번에 추론(컬럼명: Question)
     !python code/rag.py run --csv "data/test.csv"
@@ -91,11 +92,11 @@ INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "intfloat/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 480        # 청크 길이(문자 수 기준)
-CHUNK_OVERLAP = 80     # 청크 겹침
-TOP_K = 1               # 검색 상위 k개
+CHUNK_SIZE = 450        # 청크 길이(문자 수 기준)
+CHUNK_OVERLAP = 100     # 청크 겹침
+TOP_K = 1             # 검색 상위 k개
 
-SCORE_THRESHOLD = 0.9
+SCORE_THRESHOLD = 0.89
 OUTPUT_PATH = "results/"
 # -----------------------------
 # 유틸
@@ -143,9 +144,195 @@ def load_pdf_text(pdf_path: str) -> str:
     return "\n".join(texts)
 
 
+
+
+# --- 법령 전용 분할기: '제n조(제n조의m)' 단위로 자르기 + 길면 항/호로 재분할 ---
+
+# --- 조 헤더 정규식: '제n조(…)' 또는 '제n조의m(…)' + 줄 시작 + 괄호 존재 보장 + '조제' 참조 제외 ---
+# 전각 괄호(（ ）)까지 허용
+ARTICLE_RE_STRICT = re.compile(
+    r'(?m)^'                                  # 줄 시작
+    r'(?P<header>' 
+       r'제\s*\d+\s*조'                        # 제n조
+       r'(?!\s*제)'                            # '조제…항' 참조는 제외
+       r'(?:\s*의\s*\d+)?'                     # '의m' (제n조의m) 허용
+    r')'
+    r'(?=\s*[（(])'                            # 바로 괄호가 존재해야 함(lookahead)
+    r'\s*[（(]'                                # 괄호 여는 기호 소모
+    r'(?P<title>[^）)]*)'                      # 제목(비워둘 수도 있음)
+    r'[）)]',                                  # 괄호 닫기
+    re.UNICODE
+)
+
+# 폴백: 혹시 일부 문서에서 괄호가 누락된 헤더가 존재하는 경우 대비
+ARTICLE_RE_FALLBACK = re.compile(
+    r'(?m)^'
+    r'(?P<header>제\s*\d+\s*조(?!\s*제)(?:\s*의\s*\d+)?)'
+    r'(?:\s*[（(](?P<title>[^）)]*)[）)])?',    # 괄호가 없어도 허용
+    re.UNICODE
+)
+
+# 항/호 마커 (다양한 표기 대응: ①②… / '1항' / '1.' / '가.' / 괄호 숫자 등)
+PARA_SPLIT_RE = re.compile(
+    r'(?m)^(?=(?:[①-⑳]|[0-9]+\.?\s*항|[0-9]+\)|[가-하]\.|[ㄱ-ㅎ]\)|\([0-9]+\)|\([가-하]\)))'
+)
+
+def parse_korean_law_articles(raw_text: str):
+    text = _clean_text(raw_text)
+
+    # 헤더가 줄 맨 앞에 떨어지도록 약간 정규화 (PDF 추출 잡음 완화)
+    # '제176조제3항' 같은 붙은 참조는 띄어쓰기 보정
+    text = re.sub(r"(제\s*\d+\s*조)(\s*제\s*\d+\s*항)", r"\1 \2", text)
+
+    # 1) 엄격 규칙으로 시도(제목 괄호 필수)
+    matches = list(ARTICLE_RE_STRICT.finditer(text))
+    if not matches:
+        # 2) 괄호 없는 헤더가 섞인 문서 대응
+        matches = list(ARTICLE_RE_FALLBACK.finditer(text))
+        if not matches:
+            return [{"article": "전체", "title": "", "text": text}]
+
+    articles = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i+1].start() if i+1 < len(matches) else len(text)
+        header = m.group("header")
+        title = (m.groupdict().get("title") or "").strip()
+        body = text[start:end].strip()
+
+        # 헤더 행을 깔끔하게 앞줄로 정렬
+        head_full = header + (f"({title})" if title else "")
+        # 전각 괄호를 일반 괄호로 통일(보기도 좋고 후처리 쉬움)
+        head_full_alt = header + (f"（{title}）" if title else "")
+        body_norm = body
+        # 헤더 라벨 넣기
+        if head_full in body_norm:
+            body_norm = body_norm.replace(head_full, head_full + "\n", 1)
+        elif head_full_alt in body_norm:
+            body_norm = body_norm.replace(head_full_alt, head_full + "\n", 1)
+
+        articles.append({
+            "article": header.replace(" ", ""),   # 예: "제11조", "제11조의2"
+            "title": title,
+            "text": body_norm.strip(),
+        })
+    return articles
+
+
+def split_article_if_long(article_text: str, max_len: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+    
+    """
+    조(條)가 너무 길면 항/호 표기(PARA_SPLIT_RE)를 기준으로 우선 분할,
+    그래도 길면 안전하게 길이 기반 분할까지 적용.
+    """
+    text = article_text.strip()
+    if len(text) <= max_len:
+        return [text]
+
+    # 1) 항/호 기준 1차 분할
+    parts = []
+    last = 0
+    for m in PARA_SPLIT_RE.finditer(text):
+        idx = m.start()
+        if idx != last:
+            parts.append(text[last:idx].strip())
+        last = idx
+    parts.append(text[last:].strip())
+    parts = [p for p in parts if p]
+
+    # 2) 각 파트가 너무 길면 길이 기반 2차 분할
+    chunks = []
+    for p in parts:
+        if len(p) <= max_len:
+            chunks.append(p)
+        else:
+            s = 0
+            while s < len(p):
+                e = min(len(p), s + max_len)
+                chunk = p[s:e]
+                # 문장 경계 보정(선택): 마침표/줄바꿈 근처
+                cut = max(chunk.rfind("\n"), chunk.rfind("."), chunk.rfind("다."), chunk.rfind("다\n"))
+                if cut > int(len(chunk) * 0.6) and e < len(p):
+                    e = s + cut + 1
+                    chunk = p[s:e]
+                chunks.append(chunk.strip())
+                s = max(e - overlap, e)
+    return [c for c in chunks if c]
+
+# 기존 _chunk_text를 사용하되, 법령 파일엔 '조 단위' 우선 적용
+def chunk_law_text(raw_text: str, by_article: bool = True,
+                   chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+    if not by_article:
+        return _chunk_text(raw_text, chunk_size, overlap)
+
+    articles = parse_korean_law_articles(raw_text)
+    chunks = []
+    labels = []  # "제n조(제목) - 청크i" 같은 메타 라벨
+    for a in articles:
+        title = f"{a['article']}" + (f"({a['title']})" if a['title'] else "")
+        subchunks = split_article_if_long(a["text"], max_len=max(800, chunk_size*2//1), overlap=overlap)
+        for i, sc in enumerate(subchunks):
+            chunks.append(sc)
+            labels.append(f"{title}#{i+1}")
+    return chunks, labels
+
+
+
 # -----------------------------
 # 인덱서/검색기
 # -----------------------------
+
+# class RAGIndexer:
+#     def __init__(self, model_name=MODEL_NAME, device=None):
+#         self.model_name = model_name
+#         self.embedder = E5Embedder(model_name, device='cpu')
+
+#     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
+#         all_chunks, all_sources = [], []
+#         total = 0
+#         for pdf_path in pdf_paths:
+#             print(f"📄 PDF 읽는 중: {pdf_path}")
+#             raw = load_pdf_text(pdf_path)
+#             if not raw.strip():
+#                 raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+#             print("🔪 청크 분할 중...")
+#             chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+#             all_chunks.extend(chunks)
+#             all_sources.extend([os.path.basename(pdf_path)] * len(chunks))
+#             total += len(chunks)
+#             print(f"  → {os.path.basename(pdf_path)}: {len(chunks)}개")
+        
+#         if total == 0:
+#             raise ValueError("인덱싱할 청크가 없습니다.")
+
+#         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
+#         vectors = self.embedder.encode_passages(all_chunks)
+#         if vectors.shape[0] != len(all_chunks):
+#             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
+#         dim = vectors.shape[1]
+
+#         print("📦 FAISS 인덱스 생성/저장...")
+#         _ensure_dir(index_dir)
+#         index = faiss.IndexFlatIP(dim)  # 내적(코사인; 임베딩 L2 정규화 가정)
+#         index.add(vectors)
+
+#         # 원자적 저장(권장)
+#         tmp_idx = INDEX_BIN + ".tmp"
+#         tmp_meta = META_PKL + ".tmp"
+#         faiss.write_index(index, tmp_idx)
+#         meta = {
+#             "chunks": all_chunks,
+#             "sources": all_sources,
+#             "model_name": self.model_name,
+#             "n_vectors": int(vectors.shape[0]),
+#         }
+#         with open(tmp_meta, "wb") as f:
+#             pickle.dump(meta, f)
+#         os.replace(tmp_idx, INDEX_BIN)
+#         os.replace(tmp_meta, META_PKL)
+
+#         print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
+
 
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
@@ -160,13 +347,17 @@ class RAGIndexer:
             raw = load_pdf_text(pdf_path)
             if not raw.strip():
                 raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
-            print("🔪 청크 분할 중...")
-            chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
+
+            print("🔪 '제n조' 단위 청크 분할 중...")
+            chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+
+            base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
-            all_sources.extend([os.path.basename(pdf_path)] * len(chunks))
+            # 소스에 파일명 + 조 라벨을 함께 저장 (검색 결과 설명에 바로 활용)
+            all_sources.extend([f"{base}::{label}" for label in labels])
             total += len(chunks)
-            print(f"  → {os.path.basename(pdf_path)}: {len(chunks)}개")
-        
+            print(f"  → {base}: 조/항 기준 {len(chunks)}개")
+
         if total == 0:
             raise ValueError("인덱싱할 청크가 없습니다.")
 
@@ -178,16 +369,15 @@ class RAGIndexer:
 
         print("📦 FAISS 인덱스 생성/저장...")
         _ensure_dir(index_dir)
-        index = faiss.IndexFlatIP(dim)  # 내적(코사인; 임베딩 L2 정규화 가정)
+        index = faiss.IndexFlatIP(dim)  # L2 정규화된 코사인 유사도
         index.add(vectors)
 
-        # 원자적 저장(권장)
         tmp_idx = INDEX_BIN + ".tmp"
         tmp_meta = META_PKL + ".tmp"
         faiss.write_index(index, tmp_idx)
         meta = {
             "chunks": all_chunks,
-            "sources": all_sources,
+            "sources": all_sources,           # 예: "전자서명법.pdf::제22조(분쟁의 조정)#1"
             "model_name": self.model_name,
             "n_vectors": int(vectors.shape[0]),
         }
@@ -197,6 +387,7 @@ class RAGIndexer:
         os.replace(tmp_meta, META_PKL)
 
         print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
+
 
 
 class RAGRetriever:
