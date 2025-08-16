@@ -10,7 +10,7 @@
     !python code/rag.py build --dir "laws/"
 
     # 2) 단일 질문
-    !python code/rag.py ask --question "전자금융거래법 제6조의 핵심은 무엇인가?"
+    !python code/rag.py ask --question "정보보호의 3대 요소에 해당하는 보안 목표를 3가지 기술하세요."
     !python code/rag.py ask --question $'전자금융거래법 제44조에 따르면, 청문 절차가 필요한 경우는 무엇인가?\n1 전자금융거래의 중단\n2 전자금융거래의 보안 점검\n3 전자금융업자의 등록 취소\n4 전자금융거래의 수수료 변경'
     !python code/rag.py ask --question $'국내대리인이 법을 위반한 경우, 그 책임은 누구에게 있는가?\n1 국내대리인\n2 정부기관\n3 법원\n4 정보통신서비스 제공자\n5 개인정보 처리 위탁업체'
     !python code/rag.py ask --question $'개인정보보호법 제63조에 따르면, 보호위원회가 자료제출 요구 및 검사를 통해 수집한 서류나 자료를 제3자에게 제공하거나 일반에 공개할 수 있는 경우는?\n1 자료가 비밀이 아닌 경우\n2 개인정보처리자의 동의가 있는 경우\n3 정보주체가 개인정보 열람을 요청한 경우\n4 법에 따른 경우\n5 보호위원회의 내부 규정에 따른 경우'
@@ -509,6 +509,9 @@ def cmd_ask(args):
         q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
     print("\n===== 생성된 답변 =====")
     print(gen)
+    ans = extract_answer_only(gen, original_question=q, prompt=prompt)
+    print("\n===== 채택된 답변 =====")
+    print(ans)
     print("\n===== 검색 결과 요약 =====")
     if hits:
         print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
