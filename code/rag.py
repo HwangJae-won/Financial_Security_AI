@@ -42,6 +42,21 @@ from utils import is_multiple_choice, extract_question_and_choices, extract_answ
 from prompt import make_prompt_rag_exaone 
 
 
+# -----------------------------
+# 설정
+# -----------------------------
+INDEX_DIR = "./rag_index"
+INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
+META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
+MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
+CHUNK_SIZE = 450        # 청크 길이(문자 수 기준)
+CHUNK_OVERLAP = 100     # 청크 겹침
+TOP_K = 1             # 검색 상위 k개
+
+SCORE_THRESHOLD = 0.89
+OUTPUT_PATH = "results/"
+
+
 # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
 class E5Embedder:
     """
@@ -50,12 +65,13 @@ class E5Embedder:
     - passage에는 'passage: ' 프리픽스
     - mean-pooling + L2 normalize
     """
-    def __init__(self, model_name="intfloat/multilingual-e5-small", device=None):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)  # torch==2.1.0 안전
+    def __init__(self, model_name=MODEL_NAME, device=None):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
+        self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
         self.model.eval()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
+
 
     @torch.no_grad()
     def _encode(self, texts, batch_size=16):
@@ -85,19 +101,7 @@ class E5Embedder:
 
 
 
-# -----------------------------
-# 설정
-# -----------------------------
-INDEX_DIR = "./rag_index"
-INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
-META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
-MODEL_NAME = "intfloat/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 450        # 청크 길이(문자 수 기준)
-CHUNK_OVERLAP = 100     # 청크 겹침
-TOP_K = 1             # 검색 상위 k개
 
-SCORE_THRESHOLD = 0.89
-OUTPUT_PATH = "results/"
 # -----------------------------
 # 유틸
 # -----------------------------
@@ -337,7 +341,7 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
         self.model_name = model_name
-        self.embedder = E5Embedder(model_name, device='cpu')
+        self.embedder = E5Embedder(MODEL_NAME, device='cpu')
 
     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
         all_chunks, all_sources = [], []
@@ -414,7 +418,7 @@ class RAGRetriever:
             self._n_index = n
 
         # 검색시 사용할 동일 임베더 로드
-        self.embedder = E5Embedder(self.model_name, device='cpu')
+        self.embedder = E5Embedder(MODEL_NAME, device='cpu')
 
     def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
         q_emb = self.embedder.encode_queries([query]).astype("float32")
