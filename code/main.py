@@ -3,50 +3,39 @@ import os
 import pandas as pd
 from tqdm import tqdm
 from rag import setup_retriever,answer_with_rag
-from model import setup_model
+from prompt import make_prompt_rag_exaone
+from model import load_llm
 from utils import extract_answer_only, is_multiple_choice
 
-from config import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH, TOP_K, SCORE_THRESHOLD
+from config import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH, TOP_K, SCORE_THRESHOLD, MODEL_NAME,CACHE_DIR
 
 def main():
     print("--- Financial Security AI Model Started---")   
     vectorstore = setup_retriever(folder_path=LAW_PATH)
-    llm = setup_model()
+    llm = load_llm(MODEL_NAME, CACHE_DIR)
+   
+
     print("--- ✅ RAG 및 LLM 초기 설정 완료 ---\n")
 
     print("---  테스트 데이터 로딩 시작 ---")
     test_df = pd.read_csv(os.path.join(DATA_PATH, 'test.csv'))
     print(f"✅ 테스트 데이터 로드 완료, 총 문항 수: {len(test_df)}\n")
     print("--- RAG 기반 추론 시작 ---")
+
     preds = []
     
     for index, row in tqdm(test_df.iterrows(), total=len(test_df), desc="RAG 추론 진행"):
         question = row['Question']
         
-        # 1차 시도 (기본 파라미터)
-        final_answer = answer_with_rag(
-            question=question,
-            vectorstore=vectorstore,
-            pipe=llm
-        )
-        # 답변이 유효하지 않으면 재시도
-        if final_answer in ("0", "미응답"):
-            # 2차 시도 (temperature, top_p 조절)
-            llm_retry = setup_model(temperature=0.6, top_p=0.95)
-            final_answer = answer_with_rag(
-            question=question,
-            vectorstore=vectorstore,
-            pipe=llm
-        )
+        final_answer = answer_with_rag(question=question, vectorstore=vectorstore, pipe=llm)
 
         if final_answer in ("0", "미응답"):
-            # 3차 시도 (더 넓은 범위)
+            llm_retry = setup_model(temperature=0.6, top_p=0.95)
+            final_answer = answer_with_rag(question=question, vectorstore=vectorstore, pipe=llm_retry)
+
+        if final_answer in ("0", "미응답"):
             llm_retry = setup_model(temperature=0.8, top_p=1.0)
-            final_answer = answer_with_rag(
-            question=question,
-            vectorstore=vectorstore,
-            pipe=llm
-        )
+            final_answer = answer_with_rag(question=question, vectorstore=vectorstore, pipe=llm_retry)
         
         preds.append(final_answer)
 
@@ -60,8 +49,8 @@ def main():
         
     submission_df = pd.read_csv(os.path.join(DATA_PATH, "sample_submission.csv"))
     submission_df['Answer'] = preds
-    submission_df.to_csv(os.path.join(OUTPUT_PATH, "fit_condition_exaone.csv"), index=False, encoding='utf-8-sig')
-    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'fit_condition_exaone..csv')}")
+    submission_df.to_csv(os.path.join(OUTPUT_PATH, "exaone_retry.csv"), index=False, encoding='utf-8-sig')
+    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'exaone_retry.csv')}")
     print("--- ✅ 모든 작업 완료 ---")
 
 
