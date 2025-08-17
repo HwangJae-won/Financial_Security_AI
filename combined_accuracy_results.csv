@@ -1,0 +1,4 @@
+﻿dataset,correct_answers,total_questions,accuracy
+data/sample1.csv,54,80,67.5
+data/sample2.csv,58,80,72.5
+combined,112,160,70.0
