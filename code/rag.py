@@ -29,6 +29,7 @@ from typing import List, Tuple, Optional
 from tqdm import tqdm
 
 import numpy as np
+import math
 
 # 외부 패키지
 import pdfplumber
@@ -75,22 +76,22 @@ class E5Embedder:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-
     @torch.no_grad()
     def _encode(self, texts, batch_size=16):
         all_embs = []
-        for i in range(0, len(texts), batch_size):
+        n = len(texts)
+        # tqdm으로 진행률 표시
+        for i in tqdm(range(0, n, batch_size), total=math.ceil(n / batch_size), desc="Encoding"):
             batch = texts[i:i+batch_size]
-            tokens = self.tokenizer(batch, padding=True, truncation=True, return_tensors="pt", max_length=512)
+            tokens = self.tokenizer(batch, padding=True, truncation=True,
+                                    return_tensors="pt", max_length=512)
             tokens = {k: v.to(self.device) for k, v in tokens.items()}
             out = self.model(**tokens)
             last_hidden = out.last_hidden_state  # [B, T, H]
             mask = tokens["attention_mask"].unsqueeze(-1)  # [B, T, 1]
-            # mean pooling
             summed = (last_hidden * mask).sum(dim=1)
             lengths = mask.sum(dim=1).clamp(min=1)
             emb = summed / lengths
-            # L2 normalize
             emb = torch.nn.functional.normalize(emb, p=2, dim=1)
             all_embs.append(emb.cpu())
         return torch.cat(all_embs, dim=0).numpy().astype("float32")
@@ -100,7 +101,6 @@ class E5Embedder:
 
     def encode_queries(self, queries):
         return self._encode([f"query: {q}" for q in queries])
-
 
 
 
