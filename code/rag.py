@@ -49,13 +49,16 @@ INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 450        # 청크 길이(문자 수 기준)
-CHUNK_OVERLAP = 100     # 청크 겹침
+CHUNK_SIZE = 200        # 청크 길이(문자 수 기준)
+CHUNK_OVERLAP = 50     # 청크 겹침
 TOP_K = 1             # 검색 상위 k개
 
 SCORE_THRESHOLD = 0.89
 OUTPUT_PATH = "results/"
 
+RETRIEVE_K = 3      # 벡터검색 1차 후보 개수
+RERANK_KEEP = 1      # 리랭크 후 LLM에 줄 개수
+RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"  # 멀티링구얼 추천(리소스 여유 없으면 MiniLM)
 
 # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
 class E5Embedder:
@@ -110,10 +113,20 @@ def _ensure_dir(d: str):
         os.makedirs(d, exist_ok=True)
 
 def _clean_text(t: str) -> str:
+    # 기본 정리
     t = t.replace("\u3000", " ").strip()
     t = re.sub(r"[ \t]+", " ", t)
+
+    # --- "삭제<날짜>"가 포함된 '모든 줄' 제거 ---
+    # 예: "1. 삭제<2020. 2. 4.>", "제28조의6 삭제 <2023. 3. 14.>", "…삭제＜2021.1.1.＞…"
+    # - (?m): 줄 단위 매칭
+    # - .*삭제\s*[<＜][^>＞]+[>＞].*$ : 해당 줄에 '삭제<...>' 또는 '삭제＜...＞' 패턴이 있으면 그 줄 전체 삭제
+    t = re.sub(r'(?m)^.*삭제\s*[<＜][^>＞]+[>＞].*$', '', t)
+
+    # 연속 빈 줄 정리 (앞에서 줄을 지웠으니 마지막에 수행)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t
+
 
 def _chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
     text = _clean_text(text)
@@ -281,62 +294,9 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
     return chunks, labels
 
 
-
 # -----------------------------
 # 인덱서/검색기
 # -----------------------------
-
-# class RAGIndexer:
-#     def __init__(self, model_name=MODEL_NAME, device=None):
-#         self.model_name = model_name
-#         self.embedder = E5Embedder(model_name, device='cpu')
-
-#     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
-#         all_chunks, all_sources = [], []
-#         total = 0
-#         for pdf_path in pdf_paths:
-#             print(f"📄 PDF 읽는 중: {pdf_path}")
-#             raw = load_pdf_text(pdf_path)
-#             if not raw.strip():
-#                 raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
-#             print("🔪 청크 분할 중...")
-#             chunks = _chunk_text(raw, CHUNK_SIZE, CHUNK_OVERLAP)
-#             all_chunks.extend(chunks)
-#             all_sources.extend([os.path.basename(pdf_path)] * len(chunks))
-#             total += len(chunks)
-#             print(f"  → {os.path.basename(pdf_path)}: {len(chunks)}개")
-        
-#         if total == 0:
-#             raise ValueError("인덱싱할 청크가 없습니다.")
-
-#         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
-#         vectors = self.embedder.encode_passages(all_chunks)
-#         if vectors.shape[0] != len(all_chunks):
-#             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
-#         dim = vectors.shape[1]
-
-#         print("📦 FAISS 인덱스 생성/저장...")
-#         _ensure_dir(index_dir)
-#         index = faiss.IndexFlatIP(dim)  # 내적(코사인; 임베딩 L2 정규화 가정)
-#         index.add(vectors)
-
-#         # 원자적 저장(권장)
-#         tmp_idx = INDEX_BIN + ".tmp"
-#         tmp_meta = META_PKL + ".tmp"
-#         faiss.write_index(index, tmp_idx)
-#         meta = {
-#             "chunks": all_chunks,
-#             "sources": all_sources,
-#             "model_name": self.model_name,
-#             "n_vectors": int(vectors.shape[0]),
-#         }
-#         with open(tmp_meta, "wb") as f:
-#             pickle.dump(meta, f)
-#         os.replace(tmp_idx, INDEX_BIN)
-#         os.replace(tmp_meta, META_PKL)
-
-#         print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
-
 
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
@@ -438,9 +398,60 @@ class RAGRetriever:
         return [self.sources[i] for i, _ in hits]
 
 
+
+# -----------------------------
+# reranker
+# -----------------------------
+
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import torch.nn.functional as F
+
+class CrossEncoderReranker:
+    """
+    (질문, 문서청크) 쌍을 입력받아 관련성 점수를 산출하고 재정렬.
+    - 기본 모델: 가볍고 빠른 영어/멀티도 가능한 ms-marco 미니LM
+    - 대안: 'BAAI/bge-reranker-v2-m3' (멀티링구얼, 성능↑, 약간 무거움)
+            'jinaai/jina-reranker-v2-base-multilingual'
+    """
+    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2", device: str = "cpu"):
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True).to(device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def score(self, query: str, passages: list[str], batch_size: int = 16) -> list[float]:
+        scores = []
+        for i in range(0, len(passages), batch_size):
+            batch_psg = passages[i:i+batch_size]
+            encoded = self.tokenizer(
+                [query] * len(batch_psg), batch_psg,
+                padding=True, truncation=True, max_length=512, return_tensors="pt"
+            ).to(self.device)
+            logits = self.model(**encoded).logits.squeeze(-1)  # [B]
+            # 점수 스케일을 안정화하려면 시그모이드(0~1)로 보정해도 됨
+            probs = torch.sigmoid(logits).tolist()
+            scores.extend(probs)
+        return scores
+
+    def rerank(self, query: str, passages: list[str]) -> list[tuple[int, float]]:
+        """
+        return: [(원래인덱스, rerank_score)] 높은 점수 순
+        """
+        if not passages:
+            return []
+        scores = self.score(query, passages)
+        order = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)
+        return [(i, scores[i]) for i in order]
+
+
+
 # -----------------------------
 # RAG 추론 함수
 # -----------------------------
+
 def answer_with_rag(
     question: str, retriever: RAGRetriever, pipe, top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD):
     hits = retriever.search(question, top_k=top_k)
@@ -486,6 +497,130 @@ def answer_with_rag(
             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
     return prompt, gen, passages, hits, use_context
+
+# # 초기화 시점 어딘가에(전역 혹은 객체 내부)
+# device = "cuda" if torch.cuda.is_available() else "cpu"
+# reranker = CrossEncoderReranker(model_name=RERANK_MODEL, device=device)
+
+
+# def answer_with_rag(
+#     question: str, retriever: RAGRetriever, pipe,
+#     top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD,
+#     debug: bool = True,  # ← 디버그 출력 스위치
+#     return_debug: bool = False  # ← 디버그 정보를 함께 반환할지
+# ):
+#     # 1) 1차: 벡터 검색 (넉넉히)
+#     k_retrieve = RETRIEVE_K if RETRIEVE_K > top_k else top_k
+#     hits = retriever.search(question, top_k=k_retrieve)              # [(faiss_idx, vec_score)]
+#     passages = retriever.get_passages(hits)                          # [str]
+#     sources_all = retriever.get_sources(hits)                        # [str]
+#     faiss_indices = [i for i, _ in hits]                             # [int]
+#     vec_scores = [s for _, s in hits]                                # [float]
+#     top_score = vec_scores[0] if vec_scores else 0.0
+
+#     # 초기 순위표 (FAISS)
+#     initial_table = [
+#         {
+#             "rank": r+1,
+#             "faiss_idx": faiss_indices[r],
+#             "vec_score": float(vec_scores[r]),
+#             "source": sources_all[r],
+#             "passage": passages[r]
+#         }
+#         for r in range(len(passages))
+#     ]
+
+#     # 2) 임계치로 컨텍스트 사용 여부 판단 (벡터스코어 기준 유지)
+#     use_context = (top_score >= score_threshold)
+
+#     # 3) use_context면 리랭크 → 상위 n개만 선택
+#     rerank_table = []
+#     kept_idx_local = []
+#     kept_sources = []
+#     if use_context and passages:
+#         reranked = reranker.rerank(question, passages)               # [(local_idx, rerank_score)]
+#         # rerank 전체 테이블 (변화 추적용)
+#         for new_rank, (loc_idx, rr_score) in enumerate(reranked, start=1):
+#             rerank_table.append({
+#                 "new_rank": new_rank,
+#                 "from_initial_rank": loc_idx + 1,
+#                 "faiss_idx": faiss_indices[loc_idx],
+#                 "rerank_score": float(rr_score),
+#                 "vec_score": float(vec_scores[loc_idx]),
+#                 "source": sources_all[loc_idx],
+#                 "passage": passages[loc_idx]
+#             })
+#         # 상위만 유지
+#         kept_idx_local = [i for i, _ in reranked[:RERANK_KEEP]]
+#         passages = [passages[i] for i in kept_idx_local]
+#         kept_sources = [sources_all[i] for i in kept_idx_local]
+#     else:
+#         passages = []
+#         kept_sources = []
+
+#     # 4) 프롬프트 생성 및 생성
+#     prompt = make_prompt_rag_exaone(question, passages, use_fewshot=True)
+
+#     is_mc, mc_num = is_multiple_choice(question)
+#     if is_mc:
+#         out = pipe(prompt, max_new_tokens=2, do_sample=False)
+#     else:
+#         out = pipe(prompt, max_new_tokens=256, do_sample=False)
+
+#     gen = out[0]["generated_text"]
+#     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
+
+#     if ans in ("0", "미응답"):
+#         if is_mc:
+#             outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95, 
+#                         num_return_sequences=3, repetition_penalty=1.05)
+#         else:
+#             outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95, 
+#                         num_return_sequences=3, repetition_penalty=1.05)
+#         for o in outs:
+#             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
+#             if cand not in ("0", "미응답"):
+#                 gen = o["generated_text"]
+#                 break
+
+#     # 5) 객관식 숫자 후처리
+#     is_mc, _ = is_multiple_choice(question)
+#     if is_mc:
+#         m = re.search(r"\b([1-9][0-9]?)\b", gen)
+#         if not m:
+#             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
+#             gen = out[0]["generated_text"]
+
+#     # ---- 디버그 출력/반환 ----
+#     if debug:
+#         print("\n[FAISS 초기 순위]")
+#         for row in initial_table[:10]:  # 너무 길면 상위 10개만 출력
+#             print(f"{row['rank']:>2}. faiss_idx={row['faiss_idx']}, vec={row['vec_score']:.4f}, src={row['source']}")
+#         if use_context and rerank_table:
+#             print("\n[Re-Rank 결과]")
+#             for row in rerank_table[:10]:
+#                 print(f"{row['new_rank']:>2}. (from {row['from_initial_rank']:>2}) "
+#                       f"faiss_idx={row['faiss_idx']}, rr={row['rerank_score']:.4f}, vec={row['vec_score']:.4f}, src={row['source']}")
+#             if kept_idx_local:
+#                 kept_str = ", ".join([f"#{i+1}" for i in kept_idx_local])
+#                 print(f"\n→ LLM에 전달한 문맥(local rank): {kept_str} (총 {len(kept_idx_local)}개)")
+
+#     debug_payload = None
+#     if return_debug:
+#         debug_payload = {
+#             "initial": initial_table,      # FAISS 결과 전체
+#             "reranked": rerank_table,      # rerank 결과 전체
+#             "kept_local_indices": kept_idx_local,
+#             "use_context": use_context
+#         }
+
+#     # 기존 반환형을 유지하며, 필요 시 debug_payload 추가
+#     if return_debug:
+#         return (prompt, gen, passages, hits, use_context, debug_payload)
+#     else:
+#         return (prompt, gen, passages, hits, use_context)
+
+
 
 
 # -----------------------------
