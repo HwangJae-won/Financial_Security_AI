@@ -50,16 +50,12 @@ INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 200        # 청크 길이(문자 수 기준)
+CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
 TOP_K = 1             # 검색 상위 k개
 
 SCORE_THRESHOLD = 0.89
 OUTPUT_PATH = "results/"
-
-RETRIEVE_K = 3      # 벡터검색 1차 후보 개수
-RERANK_KEEP = 1      # 리랭크 후 LLM에 줄 개수
-RERANK_MODEL = "jinaai/jina-reranker-v2-base-multilingual"  # 멀티링구얼 추천(리소스 여유 없으면 MiniLM)
 
 # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
 class E5Embedder:
@@ -80,8 +76,10 @@ class E5Embedder:
     def _encode(self, texts, batch_size=16):
         all_embs = []
         n = len(texts)
+        total_batches = math.ceil(n / batch_size)
         # tqdm으로 진행률 표시
-        for i in tqdm(range(0, n, batch_size), total=math.ceil(n / batch_size), desc="Encoding"):
+        for i in tqdm(range(0, n, batch_size), 
+                      total=math.ceil(n / batch_size), desc="Encoding", disable=(total_batches <= 1)):
             batch = texts[i:i+batch_size]
             tokens = self.tokenizer(batch, padding=True, truncation=True,
                                     return_tensors="pt", max_length=512)
@@ -287,7 +285,7 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
     labels = []  # "제n조(제목) - 청크i" 같은 메타 라벨
     for a in articles:
         title = f"{a['article']}" + (f"({a['title']})" if a['title'] else "")
-        subchunks = split_article_if_long(a["text"], max_len=max(800, chunk_size*2//1), overlap=overlap)
+        subchunks = split_article_if_long(a["text"], max_len=chunk_size, overlap=overlap)
         for i, sc in enumerate(subchunks):
             chunks.append(sc)
             labels.append(f"{title}#{i+1}")
@@ -399,54 +397,6 @@ class RAGRetriever:
 
 
 
-# -----------------------------
-# reranker
-# -----------------------------
-
-
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
-import torch.nn.functional as F
-
-class CrossEncoderReranker:
-    """
-    (질문, 문서청크) 쌍을 입력받아 관련성 점수를 산출하고 재정렬.
-    - 기본 모델: 가볍고 빠른 영어/멀티도 가능한 ms-marco 미니LM
-    - 대안: 'BAAI/bge-reranker-v2-m3' (멀티링구얼, 성능↑, 약간 무거움)
-            'jinaai/jina-reranker-v2-base-multilingual'
-    """
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2", device: str = "cpu"):
-        self.device = device
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True).to(device)
-        self.model.eval()
-
-    @torch.no_grad()
-    def score(self, query: str, passages: list[str], batch_size: int = 16) -> list[float]:
-        scores = []
-        for i in range(0, len(passages), batch_size):
-            batch_psg = passages[i:i+batch_size]
-            encoded = self.tokenizer(
-                [query] * len(batch_psg), batch_psg,
-                padding=True, truncation=True, max_length=512, return_tensors="pt"
-            ).to(self.device)
-            logits = self.model(**encoded).logits.squeeze(-1)  # [B]
-            # 점수 스케일을 안정화하려면 시그모이드(0~1)로 보정해도 됨
-            probs = torch.sigmoid(logits).tolist()
-            scores.extend(probs)
-        return scores
-
-    def rerank(self, query: str, passages: list[str]) -> list[tuple[int, float]]:
-        """
-        return: [(원래인덱스, rerank_score)] 높은 점수 순
-        """
-        if not passages:
-            return []
-        scores = self.score(query, passages)
-        order = sorted(range(len(passages)), key=lambda i: scores[i], reverse=True)
-        return [(i, scores[i]) for i in order]
-
-
 
 # -----------------------------
 # RAG 추론 함수
@@ -496,130 +446,8 @@ def answer_with_rag(
         if not m:
             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
-    return prompt, gen, passages, hits, use_context
-
-# # 초기화 시점 어딘가에(전역 혹은 객체 내부)
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-# reranker = CrossEncoderReranker(model_name=RERANK_MODEL, device=device)
-
-
-# def answer_with_rag(
-#     question: str, retriever: RAGRetriever, pipe,
-#     top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD,
-#     debug: bool = True,  # ← 디버그 출력 스위치
-#     return_debug: bool = False  # ← 디버그 정보를 함께 반환할지
-# ):
-#     # 1) 1차: 벡터 검색 (넉넉히)
-#     k_retrieve = RETRIEVE_K if RETRIEVE_K > top_k else top_k
-#     hits = retriever.search(question, top_k=k_retrieve)              # [(faiss_idx, vec_score)]
-#     passages = retriever.get_passages(hits)                          # [str]
-#     sources_all = retriever.get_sources(hits)                        # [str]
-#     faiss_indices = [i for i, _ in hits]                             # [int]
-#     vec_scores = [s for _, s in hits]                                # [float]
-#     top_score = vec_scores[0] if vec_scores else 0.0
-
-#     # 초기 순위표 (FAISS)
-#     initial_table = [
-#         {
-#             "rank": r+1,
-#             "faiss_idx": faiss_indices[r],
-#             "vec_score": float(vec_scores[r]),
-#             "source": sources_all[r],
-#             "passage": passages[r]
-#         }
-#         for r in range(len(passages))
-#     ]
-
-#     # 2) 임계치로 컨텍스트 사용 여부 판단 (벡터스코어 기준 유지)
-#     use_context = (top_score >= score_threshold)
-
-#     # 3) use_context면 리랭크 → 상위 n개만 선택
-#     rerank_table = []
-#     kept_idx_local = []
-#     kept_sources = []
-#     if use_context and passages:
-#         reranked = reranker.rerank(question, passages)               # [(local_idx, rerank_score)]
-#         # rerank 전체 테이블 (변화 추적용)
-#         for new_rank, (loc_idx, rr_score) in enumerate(reranked, start=1):
-#             rerank_table.append({
-#                 "new_rank": new_rank,
-#                 "from_initial_rank": loc_idx + 1,
-#                 "faiss_idx": faiss_indices[loc_idx],
-#                 "rerank_score": float(rr_score),
-#                 "vec_score": float(vec_scores[loc_idx]),
-#                 "source": sources_all[loc_idx],
-#                 "passage": passages[loc_idx]
-#             })
-#         # 상위만 유지
-#         kept_idx_local = [i for i, _ in reranked[:RERANK_KEEP]]
-#         passages = [passages[i] for i in kept_idx_local]
-#         kept_sources = [sources_all[i] for i in kept_idx_local]
-#     else:
-#         passages = []
-#         kept_sources = []
-
-#     # 4) 프롬프트 생성 및 생성
-#     prompt = make_prompt_rag_exaone(question, passages, use_fewshot=True)
-
-#     is_mc, mc_num = is_multiple_choice(question)
-#     if is_mc:
-#         out = pipe(prompt, max_new_tokens=2, do_sample=False)
-#     else:
-#         out = pipe(prompt, max_new_tokens=256, do_sample=False)
-
-#     gen = out[0]["generated_text"]
-#     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
-
-#     if ans in ("0", "미응답"):
-#         if is_mc:
-#             outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95, 
-#                         num_return_sequences=3, repetition_penalty=1.05)
-#         else:
-#             outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95, 
-#                         num_return_sequences=3, repetition_penalty=1.05)
-#         for o in outs:
-#             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
-#             if cand not in ("0", "미응답"):
-#                 gen = o["generated_text"]
-#                 break
-
-#     # 5) 객관식 숫자 후처리
-#     is_mc, _ = is_multiple_choice(question)
-#     if is_mc:
-#         m = re.search(r"\b([1-9][0-9]?)\b", gen)
-#         if not m:
-#             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
-#             gen = out[0]["generated_text"]
-
-#     # ---- 디버그 출력/반환 ----
-#     if debug:
-#         print("\n[FAISS 초기 순위]")
-#         for row in initial_table[:10]:  # 너무 길면 상위 10개만 출력
-#             print(f"{row['rank']:>2}. faiss_idx={row['faiss_idx']}, vec={row['vec_score']:.4f}, src={row['source']}")
-#         if use_context and rerank_table:
-#             print("\n[Re-Rank 결과]")
-#             for row in rerank_table[:10]:
-#                 print(f"{row['new_rank']:>2}. (from {row['from_initial_rank']:>2}) "
-#                       f"faiss_idx={row['faiss_idx']}, rr={row['rerank_score']:.4f}, vec={row['vec_score']:.4f}, src={row['source']}")
-#             if kept_idx_local:
-#                 kept_str = ", ".join([f"#{i+1}" for i in kept_idx_local])
-#                 print(f"\n→ LLM에 전달한 문맥(local rank): {kept_str} (총 {len(kept_idx_local)}개)")
-
-#     debug_payload = None
-#     if return_debug:
-#         debug_payload = {
-#             "initial": initial_table,      # FAISS 결과 전체
-#             "reranked": rerank_table,      # rerank 결과 전체
-#             "kept_local_indices": kept_idx_local,
-#             "use_context": use_context
-#         }
-
-#     # 기존 반환형을 유지하며, 필요 시 debug_payload 추가
-#     if return_debug:
-#         return (prompt, gen, passages, hits, use_context, debug_payload)
-#     else:
-#         return (prompt, gen, passages, hits, use_context)
-
+            
+    return prompt, gen, passages, hits, use_context, contexts
 
 
 
@@ -640,11 +468,12 @@ def cmd_build(args):
         raise ValueError("PDF가 없습니다. --pdf 다중 또는 --dir를 지정하세요.")
     indexer.build_many(pdfs, INDEX_DIR)
 
+
 def cmd_ask(args):
     pipe = load_model()
     retr = RAGRetriever(INDEX_DIR, device="cpu")
     q = args.question
-    prompt, gen, passages, hits, use_context = answer_with_rag(
+    prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
         q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
     print("\n===== 생성된 답변 =====")
     print(gen)
@@ -662,38 +491,50 @@ def cmd_ask(args):
         for (idx, score), p, s in zip(hits, passages, srcs):
             print(f"\n[score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
 
+
 def cmd_run(args):
     import pandas as pd
     pipe = load_model()
     retr = RAGRetriever(INDEX_DIR, device="cpu")
     df = pd.read_csv(args.csv)
+    
     preds = []
+    context_flags = []         # context 사용 여부 (True/False)
+    generated_texts = []       # context
+
     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
-        prompt, gen, passages, hits, use_context = answer_with_rag(
+        prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
             q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
-        print(f"\n===== [문항{idx}] 생성된 답변 =====")
-        print(gen)
-        if hits:
-            print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
-        else:
-            print("검색 결과 없음 | context_used=False")
+        # print(f"\n===== [문항{idx}] 생성된 답변 =====")
+        # print(gen)
+        # if hits:
+        #     print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
+        # else:
+        #     print("검색 결과 없음 | context_used=False")
         ans = extract_answer_only(gen, original_question=q, prompt=prompt)
         
         preds.append(ans)
-        if args.verbose and i < 5:
-            print(f"\n[#{i}] Q={q[:80]}...")
-            print(f"[use_context={use_context}] top1={hits[0][1] if hits else None}")
-            print(f"[gen] {gen[:200]}...")
-
+        context_flags.append(bool(use_context))
+        generated_texts.append(gen)
     
     experiment_name = "result.csv"
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv("data/sample_submission.csv")
     sample_submission['Answer'] = preds
+    
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
     print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
-    
+
+    # ----- 추가: context 사용 여부 + 생성 답변 포함한 보조 파일 저장 -----
+    result_with_info = sample_submission.copy()
+    result_with_info["ContextUsed"] = context_flags
+    result_with_info["Generated"] = generated_texts
+
+    result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
+    result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
+    print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="RAG for 전자금융거래법")
