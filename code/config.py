@@ -10,8 +10,8 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
 CACHE_DIR = "/dev/shm/models/EXAONE-Deep-7.8B"
 TMP_DIR = "/dev/shm/tmp"
-
-TOP_K = 1
+CHROMA_PERSIST_DIRECTORY = "chroma_db"
+TOP_K = 10
 SCORE_THRESHOLD = 0.8
 
 # 실험/참고용 모델

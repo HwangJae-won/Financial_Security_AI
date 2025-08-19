@@ -3,7 +3,7 @@
 # from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch, os
-from config import LOCAL_DIR_EXAONE, CACHE_DIR, MODEL_NAME
+from config import CACHE_DIR, MODEL_NAME
 #LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
 # CACHE_DIR = "/workspace/models/EXAONE-Deep-7.8B"
 os.environ['HUGGINGFACE_HUB_CACHE'] = '/dev/shm/huggingface_cache'
