@@ -500,7 +500,8 @@ def cmd_run(args):
     
     preds = []
     context_flags = []         # context 사용 여부 (True/False)
-    generated_texts = []       # context
+    full_context = []          # context 원문
+    generated_texts = []       # 출력값
 
     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
         prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
@@ -515,6 +516,7 @@ def cmd_run(args):
         
         preds.append(ans)
         context_flags.append(bool(use_context))
+        full_context.append(contexts)
         generated_texts.append(gen)
     
     experiment_name = "result.csv"
@@ -529,6 +531,7 @@ def cmd_run(args):
     # ----- 추가: context 사용 여부 + 생성 답변 포함한 보조 파일 저장 -----
     result_with_info = sample_submission.copy()
     result_with_info["ContextUsed"] = context_flags
+    result_with_info["Contexts"] = full_context
     result_with_info["Generated"] = generated_texts
 
     result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
