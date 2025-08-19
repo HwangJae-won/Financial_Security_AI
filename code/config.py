@@ -7,8 +7,8 @@ LAW_PATH = "laws/"  # 실제 폴더 구조에 맞게 수정
 # 현재 사용 모델
 MODEL_NAME = "LGAI-EXAONE/EXAONE-Deep-7.8B"
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
-
-CACHE_DIR = "/dev/shm/huggingface_cache"
+LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
+CACHE_DIR = "/dev/shm/models/EXAONE-Deep-7.8B"
 TMP_DIR = "/dev/shm/tmp"
 
 TOP_K = 1

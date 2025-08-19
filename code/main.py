@@ -4,17 +4,20 @@ import pandas as pd
 from tqdm import tqdm
 from rag import setup_retriever,answer_with_rag
 from prompt import make_prompt_rag_exaone
-from model import load_llm
+from model import load_llm_and_tokenizer
 from utils import extract_answer_only, is_multiple_choice
 
-from config import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH, TOP_K, SCORE_THRESHOLD, MODEL_NAME,CACHE_DIR
-
+from config import FAISS_INDEX_PATH, EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH, TOP_K, SCORE_THRESHOLD, MODEL_NAME,CACHE_DIR,LOCAL_DIR_EXAONE
+os.environ['HUGGINGFACE_HUB_CACHE'] = '/dev/shm/huggingface_cache'
 def main():
     print("--- Financial Security AI Model Started---")   
+    
+    # 임베딩 및 벡터 저장소 설정 (setup_retriever 함수가 필요)
     vectorstore = setup_retriever(folder_path=LAW_PATH)
-    llm = load_llm(MODEL_NAME, CACHE_DIR)
-   
-
+    
+    # 모델과 토크나이저를 한 번만 로드합니다.
+    model, tokenizer = load_llm_and_tokenizer(MODEL_NAME, CACHE_DIR)
+    
     print("--- ✅ RAG 및 LLM 초기 설정 완료 ---\n")
 
     print("---  테스트 데이터 로딩 시작 ---")
@@ -24,18 +27,48 @@ def main():
 
     preds = []
     
+    # answer_with_rag 함수에 model, tokenizer를 전달
     for index, row in tqdm(test_df.iterrows(), total=len(test_df), desc="RAG 추론 진행"):
         question = row['Question']
         
-        final_answer = answer_with_rag(question=question, vectorstore=vectorstore, pipe=llm)
+        # 기본 파라미터로 추론
+        final_answer = answer_with_rag(
+            question=question, 
+            vectorstore=vectorstore, 
+            model=model, 
+            tokenizer=tokenizer,
+            max_new_tokens=256,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            repetition_penalty=1.05
+        )
 
         if final_answer in ("0", "미응답"):
-            llm_retry = setup_model(temperature=0.6, top_p=0.95)
-            final_answer = answer_with_rag(question=question, vectorstore=vectorstore, pipe=llm_retry)
+            # 재시도 시 파라미터만 변경하여 호출
+            final_answer = answer_with_rag(
+                question=question, 
+                vectorstore=vectorstore, 
+                model=model, 
+                tokenizer=tokenizer,
+                max_new_tokens=256,
+                do_sample=True,
+                temperature=0.6, 
+                top_p=0.95
+            )
 
         if final_answer in ("0", "미응답"):
-            llm_retry = setup_model(temperature=0.8, top_p=1.0)
-            final_answer = answer_with_rag(question=question, vectorstore=vectorstore, pipe=llm_retry)
+            # 2차 재시도
+            final_answer = answer_with_rag(
+                question=question, 
+                vectorstore=vectorstore, 
+                model=model, 
+                tokenizer=tokenizer,
+                max_new_tokens=256,
+                do_sample=True,
+                temperature=0.8, 
+                top_p=1.0
+            )
         
         preds.append(final_answer)
 

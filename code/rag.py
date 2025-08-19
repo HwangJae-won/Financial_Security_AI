@@ -3,7 +3,7 @@ import re
 import pickle
 from typing import List, Tuple
 from tqdm import tqdm
-
+from transformers import pipeline
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel
@@ -27,9 +27,11 @@ from config import MODEL_NAME, EMBEDDING_MODEL_NAME, SCORE_THRESHOLD, TOP_K, FAI
 def answer_with_rag(
     question: str,
     vectorstore,
-    pipe,
+    model,    
+    tokenizer,
     top_k: int = 20,
-    score_threshold: float = 0.89
+    score_threshold: float = 0.89,
+     **generation_params
 ):
     docs_with_scores = vectorstore.similarity_search_with_score(question, k=top_k)
     
@@ -47,7 +49,8 @@ def answer_with_rag(
         use_fewshot=True
     )
     
-    answer_text = pipe(prompt)
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    answer_text = pipe(prompt, **generation_params)
     
     final_answer = extract_answer_only(
         generated_text=f"답변:{answer_text}",
