@@ -48,3 +48,13 @@ def extract_answer_only(generated_text: str, original_question: str, prompt: str
             return str(num) if 1 <= num <= option_count else '0'
         return '0'
     return text
+
+
+def clean_markdown(text: str) -> str:
+    """
+    텍스트에서 볼드체, 이탤릭체 등 마크다운 특수문자를 제거합니다.
+    """
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text) # **text** 제거
+    text = re.sub(r'_(.*?)_', r'\1', text)     # _text_ 제거
+    text = re.sub(r'~(.*?)~', r'\1', text)     # ~text~ 제거
+    return text

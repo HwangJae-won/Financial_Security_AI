@@ -3,11 +3,12 @@ from eval_multiple import calculate_objective_accuracy_details
 from eval_subjective import calculate_subjective_score
 
 if __name__ == '__main__':
-    SUBMISSION_FILE = "results/chromadb_add.csv"
-    
+    SUBMISSION_FILE = "results/exaone_rerank_v2.csv"
+    print(f"--- 제출 파일: {SUBMISSION_FILE} ---\n")
     print("--- 객관식 점수 계산 ---")
     objective_results = calculate_objective_accuracy_details(SUBMISSION_FILE)
     objective_score = objective_results["accuracy"] / 100
+    print(f"✅ 객관식 맞힌 개수: {objective_results['correct_answers']}")
     print(f"✅ 객관식 점수: {objective_score:.4f}\n")
 
     print("--- 주관식 점수 계산 ---")

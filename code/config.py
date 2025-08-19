@@ -11,8 +11,9 @@ LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
 CACHE_DIR = "/dev/shm/models/EXAONE-Deep-7.8B"
 TMP_DIR = "/dev/shm/tmp"
 CHROMA_PERSIST_DIRECTORY = "chroma_db"
-TOP_K = 10
-SCORE_THRESHOLD = 0.8
+TOP_K = 30
+SCORE_THRESHOLD = 0.85
+
 
 # 실험/참고용 모델
 # SOLAR_MODEL_NAME = "QuantFactory/SOLAR-10.7B-Instruct-v1.0-GGUF"

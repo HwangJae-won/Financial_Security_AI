@@ -26,7 +26,14 @@ def load_llm_and_tokenizer(model_name, cache_dir):
 
     return model, tokenizer
 
-
+from sentence_transformers import CrossEncoder # Reranker 모델 import
+def load_reranker_model(model_name: str = "Dongjin-kr/ko-reranker"):
+    """
+    리랭커 모델을 로드합니다.
+    """
+    # model = CrossEncoder(model_name, max_length=512)
+    # return model
+    return CrossEncoder(model_name, max_length=512)
 
 # def load_llm_light(model_name, model_file, cache_dir, **kwargs):
 #     """
