@@ -42,6 +42,8 @@ from sentence_transformers import SentenceTransformer
 from model import load_model
 from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only
 from prompt import make_prompt_rag_exaone 
+  
+
 
 
 # -----------------------------
@@ -57,6 +59,23 @@ TOP_K = 1             # 검색 상위 k개
 
 SCORE_THRESHOLD = 0.89
 OUTPUT_PATH = "results/"
+
+
+
+os.environ["ANONYMIZED_TELEMETRY"] = "false"      # 크로마 텔레메트리 끄기
+# 혹시 환경에 따라 아래 키도 지원됩니다(둘 다 넣어도 무해).
+os.environ["CHROMADB_TELEMETRY_ENABLED"] = "false"
+
+# --- CHROMA: imports & constants ---
+from pathlib import Path
+import chromadb
+from chromadb import PersistentClient
+
+# Chroma 영구 저장 경로와 컬렉션 이름
+CHROMA_DIR = Path(INDEX_DIR) / "chroma"     # 기존 INDEX_DIR 활용
+CHROMA_COLLECTION = "rag_index"  
+
+
 
 # ---- E5 임베딩 클래스 (sentence-transformers 버전) ----
 from sentence_transformers import SentenceTransformer
@@ -93,52 +112,6 @@ class E5Embedder:
 
     def encode_queries(self, queries):
         return self._encode([f"query: {q}" for q in queries])
-
-
-
-
-# # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
-# class E5Embedder:
-#     """
-#     intfloat/multilingual-e5-small 를 transformers로 직접 로드.
-#     - query에는 'query: ' 프리픽스
-#     - passage에는 'passage: ' 프리픽스
-#     - mean-pooling + L2 normalize
-#     """
-#     def __init__(self, model_name=MODEL_NAME, device=None):
-#         self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
-#         self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
-#         self.model.eval()
-#         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-#         self.model.to(self.device)
-
-#     @torch.no_grad()
-#     def _encode(self, texts, batch_size=16):
-#         all_embs = []
-#         n = len(texts)
-#         total_batches = math.ceil(n / batch_size)
-#         # tqdm으로 진행률 표시
-#         for i in tqdm(range(0, n, batch_size), 
-#                       total=math.ceil(n / batch_size), desc="Encoding", disable=(total_batches <= 1)):
-#             batch = texts[i:i+batch_size]
-#             tokens = self.tokenizer(batch, padding=True, truncation=True,
-#                                     return_tensors="pt", max_length=512)
-#             tokens = {k: v.to(self.device) for k, v in tokens.items()}
-#             out = self.model(**tokens)
-#             last_hidden = out.last_hidden_state  # [B, T, H]
-#             mask = tokens["attention_mask"].unsqueeze(-1)  # [B, T, 1]
-#             summed = (last_hidden * mask).sum(dim=1)
-#             lengths = mask.sum(dim=1).clamp(min=1)
-#             emb = summed / lengths
-#             emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-#             all_embs.append(emb.cpu())
-#         return torch.cat(all_embs, dim=0).numpy().astype("float32")
-
-#     def encode_passages(self, passages):
-#         return self._encode([f"passage: {p}" for p in passages])
-
-#     def encode_queries(self, queries):
-#         return self._encode([f"query: {q}" for q in queries])
 
 
 
@@ -336,6 +309,106 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
 # 인덱서/검색기
 # -----------------------------
 
+# class RAGIndexer:
+#     def __init__(self, model_name=MODEL_NAME, device=None):
+#         self.model_name = model_name
+#         self.embedder = E5Embedder(MODEL_NAME, device='cpu')
+
+#     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
+#         all_chunks, all_sources = [], []
+#         total = 0
+#         for pdf_path in pdf_paths:
+#             print(f"📄 PDF 읽는 중: {pdf_path}")
+#             raw = load_pdf_text(pdf_path)
+#             if not raw.strip():
+#                 raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+
+#             print("🔪 '제n조' 단위 청크 분할 중...")
+#             chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+
+#             base = os.path.basename(pdf_path)
+#             all_chunks.extend(chunks)
+#             # 소스에 파일명 + 조 라벨을 함께 저장 (검색 결과 설명에 바로 활용)
+#             all_sources.extend([f"{base}::{label}" for label in labels])
+#             total += len(chunks)
+#             print(f"  → {base}: 조/항 기준 {len(chunks)}개")
+
+#         if total == 0:
+#             raise ValueError("인덱싱할 청크가 없습니다.")
+
+#         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
+#         vectors = self.embedder.encode_passages(all_chunks)
+#         if vectors.shape[0] != len(all_chunks):
+#             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
+#         dim = vectors.shape[1]
+
+#         print("📦 FAISS 인덱스 생성/저장...")
+#         _ensure_dir(index_dir)
+#         index = faiss.IndexFlatIP(dim)  # L2 정규화된 코사인 유사도
+#         index.add(vectors)
+
+#         tmp_idx = INDEX_BIN + ".tmp"
+#         tmp_meta = META_PKL + ".tmp"
+#         faiss.write_index(index, tmp_idx)
+#         meta = {
+#             "chunks": all_chunks,
+#             "sources": all_sources,           # 예: "전자서명법.pdf::제22조(분쟁의 조정)#1"
+#             "model_name": self.model_name,
+#             "n_vectors": int(vectors.shape[0]),
+#         }
+#         with open(tmp_meta, "wb") as f:
+#             pickle.dump(meta, f)
+#         os.replace(tmp_idx, INDEX_BIN)
+#         os.replace(tmp_meta, META_PKL)
+
+#         print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
+
+
+
+# class RAGRetriever:
+#     def __init__(self, index_dir=INDEX_DIR, device=None):
+#         if not (os.path.exists(INDEX_BIN) and os.path.exists(META_PKL)):
+#             raise FileNotFoundError("인덱스가 없습니다. 먼저 `python rag.py build --pdf <path>`를 실행하세요.")
+#         self.index = faiss.read_index(INDEX_BIN)
+#         with open(META_PKL, "rb") as f:
+#             meta = pickle.load(f)
+#         self.chunks = list(meta["chunks"])
+#         self.sources = list(meta.get("sources", ["unknown"] * len(self.chunks)))
+#         self.model_name = meta.get("model_name", MODEL_NAME)
+#         self._n_meta = len(self.chunks)
+#         self._n_index = int(self.index.ntotal)
+#         # 불일치 보정(더 작은 쪽으로 자르기)
+#         expect = int(meta.get("n_vectors", self._n_meta))
+#         if expect != self._n_index or self._n_meta != self._n_index:
+#             print(f"⚠️ meta/Index 불일치. meta.chunks={self._n_meta}, meta.n_vectors={expect}, index.ntotal={self._n_index}. "
+#                   f"{min(self._n_meta, self._n_index)}개로 보정합니다.")
+#             n = min(self._n_meta, self._n_index)
+#             self.chunks = self.chunks[:n]
+#             self.sources = self.sources[:n]
+#             self._n_meta = n
+#             self._n_index = n
+
+#         # 검색시 사용할 동일 임베더 로드
+#         self.embedder = E5Embedder(MODEL_NAME, device='cpu')
+
+#     def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
+#         q_emb = self.embedder.encode_queries([query]).astype("float32")
+#         k = min(int(top_k), self._n_index) if self._n_index > 0 else 0
+#         if k <= 0:
+#             return []
+#         D, I = self.index.search(q_emb, k)
+#         raw = list(zip(I[0].tolist(), D[0].tolist()))
+#         # 유효 인덱스만 필터(-1/범위 초과 제거)
+#         results = [(idx, float(score)) for idx, score in raw if (0 <= idx < self._n_meta)]
+#         return results
+
+#     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
+#         return [self.chunks[i] for i, _ in hits]
+
+#     def get_sources(self, hits: List[Tuple[int, float]]) -> List[str]:
+#         return [self.sources[i] for i, _ in hits]
+
+
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
         self.model_name = model_name
@@ -355,7 +428,6 @@ class RAGIndexer:
 
             base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
-            # 소스에 파일명 + 조 라벨을 함께 저장 (검색 결과 설명에 바로 활용)
             all_sources.extend([f"{base}::{label}" for label in labels])
             total += len(chunks)
             print(f"  → {base}: 조/항 기준 {len(chunks)}개")
@@ -364,77 +436,122 @@ class RAGIndexer:
             raise ValueError("인덱싱할 청크가 없습니다.")
 
         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
-        vectors = self.embedder.encode_passages(all_chunks)
+        vectors = self.embedder.encode_passages(all_chunks)  # (N, dim) float32
         if vectors.shape[0] != len(all_chunks):
             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
         dim = vectors.shape[1]
+        print(f"  → dim={dim}")
 
-        print("📦 FAISS 인덱스 생성/저장...")
-        _ensure_dir(index_dir)
-        index = faiss.IndexFlatIP(dim)  # L2 정규화된 코사인 유사도
-        index.add(vectors)
+        # --- CHROMA: 영구 클라이언트/컬렉션 생성 ---
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        client = PersistentClient(path=str(CHROMA_DIR))
 
-        tmp_idx = INDEX_BIN + ".tmp"
-        tmp_meta = META_PKL + ".tmp"
-        faiss.write_index(index, tmp_idx)
-        meta = {
-            "chunks": all_chunks,
-            "sources": all_sources,           # 예: "전자서명법.pdf::제22조(분쟁의 조정)#1"
-            "model_name": self.model_name,
-            "n_vectors": int(vectors.shape[0]),
-        }
-        with open(tmp_meta, "wb") as f:
-            pickle.dump(meta, f)
-        os.replace(tmp_idx, INDEX_BIN)
-        os.replace(tmp_meta, META_PKL)
+        # 중복 빌드를 피하려면 기존 컬렉션 삭제 후 재생성(선택)
+        try:
+            client.delete_collection(CHROMA_COLLECTION)
+            print(f"🗑️ 기존 컬렉션 '{CHROMA_COLLECTION}' 삭제")
+        except Exception:
+            pass
 
-        print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
+        collection = client.create_collection(
+            name=CHROMA_COLLECTION,
+            metadata={
+                "hnsw:space": "cosine",   # E5는 L2 정규화 → cosine 추천
+                "model_name": self.model_name,
+            },
+        )
 
+        # --- CHROMA: upsert ---
+        print("📦 ChromaDB 업서트(add) 중...")
+        # ids는 고유 문자열 필요
+        ids = [f"doc-{i}" for i in range(len(all_chunks))]
+        metadatas = [{"source": s} for s in all_sources]
+        # chroma는 list-of-list/pythonic 타입 권장
+        collection.add(
+            ids=ids,
+            documents=list(all_chunks),
+            embeddings=vectors.tolist(),
+            metadatas=metadatas,
+        )
+
+        print(f"✅ 저장 완료: Chroma @ {CHROMA_DIR}, collection='{CHROMA_COLLECTION}' | 총 청크 {total}개")
 
 
 class RAGRetriever:
     def __init__(self, index_dir=INDEX_DIR, device=None):
-        if not (os.path.exists(INDEX_BIN) and os.path.exists(META_PKL)):
-            raise FileNotFoundError("인덱스가 없습니다. 먼저 `python rag.py build --pdf <path>`를 실행하세요.")
-        self.index = faiss.read_index(INDEX_BIN)
-        with open(META_PKL, "rb") as f:
-            meta = pickle.load(f)
-        self.chunks = list(meta["chunks"])
-        self.sources = list(meta.get("sources", ["unknown"] * len(self.chunks)))
-        self.model_name = meta.get("model_name", MODEL_NAME)
+        # --- CHROMA: 로드 ---
+        if not (CHROMA_DIR.exists()):
+            raise FileNotFoundError("Chroma 인덱스가 없습니다. 먼저 `python rag.py build --pdf <path>`를 실행하세요.")
+        client = PersistentClient(path=str(CHROMA_DIR))
+        try:
+            self.collection = client.get_collection(CHROMA_COLLECTION)
+        except Exception as e:
+            raise FileNotFoundError(f"Chroma 컬렉션 '{CHROMA_COLLECTION}'을 찾을 수 없습니다.") from e
+
+        # 메모리 캐시(FAISS 호환 인터페이스 유지를 위해)
+        got = self.collection.get(include=["documents", "metadatas"])
+        self.doc_ids: List[str] = got["ids"]
+        self.chunks: List[str] = got["documents"]
+        # 메타에 source 없으면 'unknown'
+        self.sources: List[str] = [
+            (m.get("source") if m else "unknown") for m in got.get("metadatas", [])
+        ]
+
+        # id -> local index 맵
+        self._id2idx = {id_: i for i, id_ in enumerate(self.doc_ids)}
+        self._n_index = len(self.doc_ids)
         self._n_meta = len(self.chunks)
-        self._n_index = int(self.index.ntotal)
-        # 불일치 보정(더 작은 쪽으로 자르기)
-        expect = int(meta.get("n_vectors", self._n_meta))
-        if expect != self._n_index or self._n_meta != self._n_index:
-            print(f"⚠️ meta/Index 불일치. meta.chunks={self._n_meta}, meta.n_vectors={expect}, index.ntotal={self._n_index}. "
-                  f"{min(self._n_meta, self._n_index)}개로 보정합니다.")
-            n = min(self._n_meta, self._n_index)
-            self.chunks = self.chunks[:n]
-            self.sources = self.sources[:n]
-            self._n_meta = n
-            self._n_index = n
 
         # 검색시 사용할 동일 임베더 로드
         self.embedder = E5Embedder(MODEL_NAME, device='cpu')
 
+        # 모델명 (옵션)
+        try:
+            self.model_name = self.collection.metadata.get("model_name", MODEL_NAME)
+        except Exception:
+            self.model_name = MODEL_NAME
+
+        # 불일치 보정
+        if self._n_index != self._n_meta:
+            n = min(self._n_index, self._n_meta)
+            print(f"⚠️ meta/Index 불일치. index={self._n_index}, meta={self._n_meta}. {n}개로 보정합니다.")
+            self.doc_ids = self.doc_ids[:n]
+            self.chunks = self.chunks[:n]
+            self.sources = self.sources[:n]
+            self._id2idx = {id_: i for i, id_ in enumerate(self.doc_ids)}
+            self._n_index = n
+            self._n_meta = n
+
     def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
-        q_emb = self.embedder.encode_queries([query]).astype("float32")
-        k = min(int(top_k), self._n_index) if self._n_index > 0 else 0
-        if k <= 0:
+        if self._n_index <= 0:
             return []
-        D, I = self.index.search(q_emb, k)
-        raw = list(zip(I[0].tolist(), D[0].tolist()))
-        # 유효 인덱스만 필터(-1/범위 초과 제거)
-        results = [(idx, float(score)) for idx, score in raw if (0 <= idx < self._n_meta)]
-        return results
+        k = min(int(top_k), self._n_index)
+        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()  # [[D]]
+
+        # --- CHROMA: 질의 ---
+        # distances는 'cosine distance' (작을수록 가까움). FAISS(IP) 호환을 위해 similarity=1-distance로 변환
+        res = self.collection.query(
+            query_embeddings=q_emb,
+            n_results=k,
+            include=["distances"],
+        )
+        ids = res["ids"][0]
+        dists = res["distances"][0]
+
+        hits: List[Tuple[int, float]] = []
+        for id_, dist in zip(ids, dists):
+            idx = self._id2idx.get(id_)
+            if idx is None:
+                continue
+            sim = 1.0 - float(dist)  # cosine distance → similarity
+            hits.append((idx, sim))
+        return hits
 
     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.chunks[i] for i, _ in hits]
 
     def get_sources(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.sources[i] for i, _ in hits]
-
 
 
 
