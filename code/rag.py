@@ -36,6 +36,7 @@ import pdfplumber
 from transformers import AutoTokenizer, AutoModel
 import torch
 import faiss
+from sentence_transformers import SentenceTransformer
 
 # 기존 프로젝트 모듈
 from model import load_model
@@ -57,48 +58,87 @@ TOP_K = 1             # 검색 상위 k개
 SCORE_THRESHOLD = 0.89
 OUTPUT_PATH = "results/"
 
-# ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
+# ---- E5 임베딩 클래스 (sentence-transformers 버전) ----
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
 class E5Embedder:
     """
-    intfloat/multilingual-e5-small 를 transformers로 직접 로드.
+    intfloat/multilingual-e5-small 를 SentenceTransformer로 로드.
     - query에는 'query: ' 프리픽스
     - passage에는 'passage: ' 프리픽스
-    - mean-pooling + L2 normalize
+    - SBERT 내부 mean-pooling + L2 normalize 사용
     """
     def __init__(self, model_name=MODEL_NAME, device=None):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
-        self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
-        self.model.eval()
+        # device: 'cpu' 또는 'cuda'
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        self.model = SentenceTransformer(model_name, device=self.device)
+        # E5는 512 토큰권장. 필요 시 명시적으로 고정 가능
+        self.model.max_seq_length = 512
 
-    @torch.no_grad()
-    def _encode(self, texts, batch_size=16):
-        all_embs = []
-        n = len(texts)
-        total_batches = math.ceil(n / batch_size)
-        # tqdm으로 진행률 표시
-        for i in tqdm(range(0, n, batch_size), 
-                      total=math.ceil(n / batch_size), desc="Encoding", disable=(total_batches <= 1)):
-            batch = texts[i:i+batch_size]
-            tokens = self.tokenizer(batch, padding=True, truncation=True,
-                                    return_tensors="pt", max_length=512)
-            tokens = {k: v.to(self.device) for k, v in tokens.items()}
-            out = self.model(**tokens)
-            last_hidden = out.last_hidden_state  # [B, T, H]
-            mask = tokens["attention_mask"].unsqueeze(-1)  # [B, T, 1]
-            summed = (last_hidden * mask).sum(dim=1)
-            lengths = mask.sum(dim=1).clamp(min=1)
-            emb = summed / lengths
-            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
-            all_embs.append(emb.cpu())
-        return torch.cat(all_embs, dim=0).numpy().astype("float32")
+    def _encode(self, texts, batch_size=16, show_progress=None):
+        # SBERT가 pooling/정규화까지 처리
+        embs = self.model.encode(
+            texts,
+            batch_size=batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=True,   # FAISS IP(코사인)와 일치
+            show_progress_bar=(show_progress if show_progress is not None else (len(texts) > batch_size))
+        )
+        # float32로 고정(FAISS/메모리 일관성)
+        return embs.astype(np.float32, copy=False)
 
     def encode_passages(self, passages):
         return self._encode([f"passage: {p}" for p in passages])
 
     def encode_queries(self, queries):
         return self._encode([f"query: {q}" for q in queries])
+
+
+
+
+# # ---- E5 임베딩 클래스 (sentence-transformers 대체) ----
+# class E5Embedder:
+#     """
+#     intfloat/multilingual-e5-small 를 transformers로 직접 로드.
+#     - query에는 'query: ' 프리픽스
+#     - passage에는 'passage: ' 프리픽스
+#     - mean-pooling + L2 normalize
+#     """
+#     def __init__(self, model_name=MODEL_NAME, device=None):
+#         self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, use_fast=True)
+#         self.model = AutoModel.from_pretrained(model_name, local_files_only=True)
+#         self.model.eval()
+#         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+#         self.model.to(self.device)
+
+#     @torch.no_grad()
+#     def _encode(self, texts, batch_size=16):
+#         all_embs = []
+#         n = len(texts)
+#         total_batches = math.ceil(n / batch_size)
+#         # tqdm으로 진행률 표시
+#         for i in tqdm(range(0, n, batch_size), 
+#                       total=math.ceil(n / batch_size), desc="Encoding", disable=(total_batches <= 1)):
+#             batch = texts[i:i+batch_size]
+#             tokens = self.tokenizer(batch, padding=True, truncation=True,
+#                                     return_tensors="pt", max_length=512)
+#             tokens = {k: v.to(self.device) for k, v in tokens.items()}
+#             out = self.model(**tokens)
+#             last_hidden = out.last_hidden_state  # [B, T, H]
+#             mask = tokens["attention_mask"].unsqueeze(-1)  # [B, T, 1]
+#             summed = (last_hidden * mask).sum(dim=1)
+#             lengths = mask.sum(dim=1).clamp(min=1)
+#             emb = summed / lengths
+#             emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+#             all_embs.append(emb.cpu())
+#         return torch.cat(all_embs, dim=0).numpy().astype("float32")
+
+#     def encode_passages(self, passages):
+#         return self._encode([f"passage: {p}" for p in passages])
+
+#     def encode_queries(self, queries):
+#         return self._encode([f"query: {q}" for q in queries])
 
 
 
