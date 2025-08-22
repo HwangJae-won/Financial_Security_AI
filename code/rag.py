@@ -53,7 +53,7 @@ INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
+CHUNK_SIZE = 800        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
 TOP_K = 1             # 검색 상위 k개
 
@@ -312,12 +312,20 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
 class STReranker:
     """
     Sentence-Transformers CrossEncoder 기반 재정렬기.
-    - 기본 모델: BAAI/bge-reranker-v2-m3 (멀티링궐)
+    - 기본 모델: "Alibaba-NLP/gte-multilingual-reranker-base" (멀티링궐)
     - 입력: (query, passages[list[str]])
     - 출력: scores[list[float]] (클수록 관련성 높음)
     """
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str | None = None, max_length: int = 512):
-        self.model = CrossEncoder(model_name, device=device, max_length=max_length)
+    def __init__(self, model_name_or_path: str = "/workspace/models/gte-multilingual-reranker-base", 
+                 device: str | None = None, max_length: int = 512, trust_remote_code=True):
+
+         # model_name_or_path에 로컬 디렉토리 or HF 모델명 모두 허용
+        path = model_name_or_path
+        if os.path.isdir(model_name_or_path):
+            # 로컬 디렉토리 우선 사용
+            path = model_name_or_path
+            
+        self.model = CrossEncoder(model_name_or_path, device=device, max_length=max_length, trust_remote_code=True)
 
     @torch.no_grad()
     def score(self, query: str, passages: list[str], batch_size: int = 32) -> list[float]:
@@ -833,7 +841,7 @@ def answer_with_rag(
     top_k=TOP_K,
     score_threshold: float = SCORE_THRESHOLD,   # 임베딩 검색용 임계값(폴백)
     reranker: Optional["STReranker"] = None,       # ★ 추가: CrossEncoder reranker
-    rerank_threshold: float = 0.0,              # ★ 추가: reranker 점수 임계값
+    rerank_threshold: float = 0.3,              # ★ 추가: reranker 점수 임계값
     M_generic: int = 1,                        # ★ 추가: 전역 후보 수
     M_filtered: int = 1,                       # ★ 추가: 법/조문 필터 후보 수
 ):
@@ -950,16 +958,16 @@ def cmd_ask(args):
     retr = RAGRetriever(INDEX_DIR, device="cpu")
 
     # --- Reranker 준비 (없으면 CPU로도 동작) ---
-    rr_model = getattr(args, "rerank_model", "BAAI/bge-reranker-v2-m3")
+    rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
-    reranker = STReranker(model_name=rr_model, device=rr_device, max_length=512)
+    reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=512)
 
     # 하이퍼파라미터
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)      # 임베딩 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", 0.0)          # reranker 컨텍스트 게이트
-    M_generic = getattr(args, "M_generic", 80)
-    M_filtered = getattr(args, "M_filtered", 80)
+    rerank_threshold = getattr(args, "rerank_threshold", 0.3)          # reranker 컨텍스트 게이트
+    M_generic = getattr(args, "M_generic", 1)
+    M_filtered = getattr(args, "M_filtered", 1)
 
     q = args.question
 
@@ -1055,9 +1063,9 @@ def cmd_run(args):
     retr = RAGRetriever(INDEX_DIR, device="cpu")
 
     # 2) Reranker 준비 (없으면 CPU로도 동작)
-    rr_model = getattr(args, "rerank_model", "BAAI/bge-reranker-v2-m3")
+    rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
-    reranker = STReranker(model_name=rr_model, device=rr_device, max_length=800)
+    reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=800)
 
     # 3) CSV 로드
     df = pd.read_csv(args.csv)
@@ -1072,7 +1080,7 @@ def cmd_run(args):
     # 하이퍼파라미터(없으면 기본값 사용)
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)          # embed 검색 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", 0.0)              # reranker 점수 임계값
+    rerank_threshold = getattr(args, "rerank_threshold", 0.3)              # reranker 점수 임계값
     M_generic = getattr(args, "M_generic", 1)                              # 전역 후보 수
     M_filtered = getattr(args, "M_filtered", 1)                            # 필터 후보 수
 
