@@ -33,10 +33,10 @@ import math
 
 # 외부 패키지
 import pdfplumber
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 import torch
 import faiss
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # 기존 프로젝트 모듈
 from model import load_model
@@ -306,6 +306,32 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
 
 
 # -----------------------------
+# Reranker
+# -----------------------------
+
+class STReranker:
+    """
+    Sentence-Transformers CrossEncoder 기반 재정렬기.
+    - 기본 모델: BAAI/bge-reranker-v2-m3 (멀티링궐)
+    - 입력: (query, passages[list[str]])
+    - 출력: scores[list[float]] (클수록 관련성 높음)
+    """
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", device: str | None = None, max_length: int = 512):
+        self.model = CrossEncoder(model_name, device=device, max_length=max_length)
+
+    @torch.no_grad()
+    def score(self, query: str, passages: list[str], batch_size: int = 32) -> list[float]:
+        if not passages:
+            return []
+        # 너무 긴 본문이면 대략 자르기(토큰 기준 아님, 안전장치)
+        trimmed = [p[:4000] for p in passages]
+        pairs = [(query, p) for p in trimmed]
+        scores = self.model.predict(pairs, batch_size=batch_size, convert_to_numpy=True)
+        return scores.tolist()
+
+
+
+# -----------------------------
 # 인덱서/검색기
 # -----------------------------
 
@@ -409,6 +435,40 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
 #         return [self.sources[i] for i, _ in hits]
 
 
+
+_ART_RE = re.compile(r"제\s*(\d+)\s*조(?:\s*의\s*(\d+))?", re.UNICODE)  # 제22조의2 → (22, 2)
+_CLAUSE_RE = re.compile(r"(?:제)?\s*(\d+)\s*항")
+
+def _norm_law_name_from_filename(base: str) -> str:
+    name = os.path.splitext(base)[0]
+    name = re.sub(r"\(.*?\)", "", name)        # 괄호군 제거
+    name = name.replace(" ", "")
+    name = name.replace("개인정보 보호법", "개인정보보호법")  # 흔한 표기 정규화 예시
+    return name
+
+def _parse_label_to_meta(label: str):
+    s = label.replace(" ", "")
+    a = _ART_RE.search(s)
+    a_num = int(a.group(1)) if a else None
+    a_bis = int(a.group(2)) if (a and a.group(2)) else None
+    clause = None
+    c = _CLAUSE_RE.search(label)
+    if c: clause = int(c.group(1))
+    article_key = str(a_num) + (f"-{a_bis}" if (a_num and a_bis) else "") if a_num else None
+    return {"article_num": a_num, "article_bis": a_bis, "article_key": article_key, "clause": clause}
+
+def _sanitize_meta(d: dict) -> dict:
+    out = {}
+    for k, v in d.items():
+        if v is None:
+            continue  # None은 키째로 제거
+        if isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        else:
+            out[k] = str(v)  # 혹시 모를 비허용 타입 방지
+    return out
+
+
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
         self.model_name = model_name
@@ -416,6 +476,7 @@ class RAGIndexer:
 
     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
         all_chunks, all_sources = [], []
+        metas = []   # ★ 추가: 청크별 메타 담을 리스트
         total = 0
         for pdf_path in pdf_paths:
             print(f"📄 PDF 읽는 중: {pdf_path}")
@@ -429,6 +490,15 @@ class RAGIndexer:
             base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
             all_sources.extend([f"{base}::{label}" for label in labels])
+            # ★ 추가: 라벨→메타 파싱 + 법령명 주입
+            law_name = _norm_law_name_from_filename(base)
+            for lbl in labels:
+                m = _parse_label_to_meta(lbl)
+                m.update({
+                    "law": law_name,                # 필터에 쓸 법령명
+                    "source": f"{base}::{lbl}",     # 표시용
+                })
+                metas.append(_sanitize_meta(m))
             total += len(chunks)
             print(f"  → {base}: 조/항 기준 {len(chunks)}개")
 
@@ -465,17 +535,43 @@ class RAGIndexer:
         print("📦 ChromaDB 업서트(add) 중...")
         # ids는 고유 문자열 필요
         ids = [f"doc-{i}" for i in range(len(all_chunks))]
-        metadatas = [{"source": s} for s in all_sources]
+        # ★ 교체: 위에서 만든 metas 사용 (길이 검증)
+        assert len(metas) == len(all_chunks), f"metas({len(metas)}) != chunks({len(all_chunks)})"
         # chroma는 list-of-list/pythonic 타입 권장
         collection.add(
             ids=ids,
             documents=list(all_chunks),
             embeddings=vectors.tolist(),
-            metadatas=metadatas,
+            metadatas=metas,
         )
 
         print(f"✅ 저장 완료: Chroma @ {CHROMA_DIR}, collection='{CHROMA_COLLECTION}' | 총 청크 {total}개")
 
+
+# === 상단 공용 ===
+_LAW_NAME_RE = re.compile(r"([가-힣A-Za-z0-9·\s]+?(?:법|령|칙|규정|고시|지침))")
+
+def _extract_explicit_law_and_article(q: str):
+    # 법령명
+    law = None
+    cand = _LAW_NAME_RE.findall(q)
+    if cand:
+        law = max(cand, key=len).replace(" ", "")
+        law = law.replace("개인정보 보호법", "개인정보보호법")
+    # 조/조의
+    a = _ART_RE.search(q.replace(" ", ""))
+    a_num, a_bis = None, None
+    if a:
+        a_num = int(a.group(1))
+        a_bis = int(a.group(2)) if a.group(2) else None
+    # 항
+    clause = None
+    c = _CLAUSE_RE.search(q)
+    if c:
+        clause = int(c.group(1))
+    # article_key(문자열)는 보조용으로 필요 시 구성
+    article_key = str(a_num) + (f"-{a_bis}" if (a_num and a_bis) else "") if a_num else None
+    return law, a_num, a_bis, clause, article_key
 
 class RAGRetriever:
     def __init__(self, index_dir=INDEX_DIR, device=None):
@@ -522,30 +618,153 @@ class RAGRetriever:
             self._n_index = n
             self._n_meta = n
 
-    def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
-        if self._n_index <= 0:
+    
+    def _where_all(self, **kv):
+        terms = [{k: v} for k, v in kv.items() if v is not None]
+        if not terms:
+            return None
+        return {"$and": terms}
+    
+    def _to_hits(self, res):
+        """
+        Chroma query/get 응답을 (idx, similarity) 리스트로 변환
+        - res["ids"]      : List[List[str]]
+        - res["distances"]: List[List[float]]  (include=["distances"]로 요청해야 옴)
+        """
+        # 빈 결과 방어
+        if not res or "ids" not in res or not res["ids"] or not res["ids"][0]:
             return []
-        k = min(int(top_k), self._n_index)
-        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()  # [[D]]
-
-        # --- CHROMA: 질의 ---
-        # distances는 'cosine distance' (작을수록 가까움). FAISS(IP) 호환을 위해 similarity=1-distance로 변환
-        res = self.collection.query(
-            query_embeddings=q_emb,
-            n_results=k,
-            include=["distances"],
-        )
+    
         ids = res["ids"][0]
-        dists = res["distances"][0]
-
-        hits: List[Tuple[int, float]] = []
+        # distances가 없을 수도 있으니 0.0으로 폴백
+        dists = res.get("distances", [[0.0] * len(ids)])[0]
+    
+        out = []
         for id_, dist in zip(ids, dists):
             idx = self._id2idx.get(id_)
             if idx is None:
                 continue
-            sim = 1.0 - float(dist)  # cosine distance → similarity
-            hits.append((idx, sim))
-        return hits
+            sim = 1.0 - float(dist)  # cosine distance -> similarity
+            out.append((idx, sim))
+        return out
+        
+    def search_mix_and_rerank(
+        self,
+        query: str,
+        top_k: int = TOP_K,
+        M_generic: int = 1,     # 전역 검색 후보 수
+        M_filtered: int = 1,    # 필터 검색 후보 수 (질의에 법+조문 있을 때만)
+        reranker: Optional["STReranker"] = None,
+        use_clause: bool = True, # '항'까지 있으면 더 좁히기
+    ) -> list[tuple[int, float]]:
+        """
+        1) 전역 검색 M_generic
+        2) (질의에 '법+조문'이 명시된 경우) where 필터로 M_filtered
+        3) 두 후보를 합쳐서 CrossEncoder로 rerank → Top-K 반환
+           반환 score는 reranker 점수
+        """
+        if self._n_index <= 0:
+            return []
+    
+        k = min(int(top_k), self._n_index)
+    
+        # --- 1) 전역 검색
+        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
+        res_global = self.collection.query(
+            query_embeddings=q_emb,
+            n_results=min(M_generic, self._n_index),
+            include=["distances"],
+        )
+        hits_global = self._to_hits(res_global)
+    
+        # --- 2) 법+조문 파싱 후(있을 때만) 메타 필터 검색
+        law, a_num, a_bis, clause, _article_key = _extract_explicit_law_and_article(query)
+        hits_filtered = []
+        if law and (a_num is not None):
+            where = self._where_all(law=law, article_num=a_num, article_bis=a_bis)
+            if use_clause and (clause is not None):
+                where_clause = self._where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
+                res_f1 = self.collection.query(
+                    query_embeddings=q_emb, n_results=min(M_filtered, self._n_index),
+                    where=where_clause, include=["distances"]
+                )
+                hits_filtered = self._to_hits(res_f1)
+                # 항으로 너무 좁아서 부족하면 조문 수준으로 보충
+                if len(hits_filtered) < min(M_filtered, self._n_index):
+                    res_f2 = self.collection.query(
+                        query_embeddings=q_emb, n_results=min(M_filtered, self._n_index),
+                        where=where, include=["distances"]
+                    )
+                    hits_filtered += [h for h in self._to_hits(res_f2) if h not in hits_filtered]
+            else:
+                res_f = self.collection.query(
+                    query_embeddings=q_emb, n_results=min(M_filtered, self._n_index),
+                    where=where, include=["distances"]
+                )
+                hits_filtered = self._to_hits(res_f)
+    
+        # --- 3) 후보 합치기(중복 제거)
+        # idx 기준 dedup, 우선순위는 filtered > global (동일 idx면 한 번만)
+        seen = set()
+        combined = []
+        for h in hits_filtered + hits_global:
+            if h[0] in seen:
+                continue
+            seen.add(h[0])
+            combined.append(h)
+        if not combined:
+            return []
+    
+        # --- 4) Rerank (없으면 combined 유사도 점수 그대로 정렬)
+        if reranker is None:
+            # 기존 유사도(sim) 기준 내림차순 후 Top-K
+            combined.sort(key=lambda x: x[1], reverse=True)
+            return combined[:k]
+    
+        passages = [self.chunks[i] for i, _ in combined]
+        scores = reranker.score(query, passages, batch_size=32)
+        # reranker 점수로 재정렬
+        reranked = sorted(zip([i for i, _ in combined], scores), key=lambda x: x[1], reverse=True)
+        # Top-K 반환: (idx, rerank_score)
+        return reranked[:k]
+    
+    # === RAGRetriever 내부 ===
+    def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
+        if self._n_index <= 0:
+            return []
+        k = min(int(top_k), self._n_index)
+        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
+            
+        law, a_num, a_bis, clause, article_key = _extract_explicit_law_and_article(query)
+        
+        # 1) 명시적 법 + '조'(및 '조의')가 있으면 '숫자'로 필터
+        if law and a_num is not None:
+            where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
+            # (선택) 항까지 있으면 더 좁히기 시도
+            if clause is not None:
+                where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
+                res = self.collection.query(query_embeddings=q_emb, n_results=k, where=where_clause, include=["distances"])
+                hits = _to_hits(res)
+                if hits:   # 최소 1건 나오면 여기서 반환
+                    # 부족하면 같은 조문(where)로 보충
+                    if len(hits) < k:
+                        res2 = self.collection.query(query_embeddings=q_emb, n_results=k, where=where, include=["distances"])
+                        more = _to_hits(res2)
+                        seen = {i for i, _ in hits}
+                        hits.extend([(i, s) for i, s in more if i not in seen])
+                        hits = sorted(hits, key=lambda x: x[1], reverse=True)[:k]
+                    return hits
+            # 항이 없거나 0건이면 조문 수준으로 재시도
+            res = self.collection.query(query_embeddings=q_emb, n_results=k, where=where, include=["distances"])
+            hits = _to_hits(res)
+            if hits:
+                return hits
+        
+        # 2) 필터 결과가 0이면 전역 검색 폴백 (원래대로)
+        res = self.collection.query(query_embeddings=q_emb, n_results=k, include=["distances"])
+        return _to_hits(res)
+
+
 
     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.chunks[i] for i, _ in hits]
@@ -559,52 +778,128 @@ class RAGRetriever:
 # RAG 추론 함수
 # -----------------------------
 
-def answer_with_rag(
-    question: str, retriever: RAGRetriever, pipe, top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD):
-    hits = retriever.search(question, top_k=top_k)
-    passages = retriever.get_passages(hits)
-    top_score = hits[0][1] if hits else 0.0
+# def answer_with_rag(
+#     question: str, retriever: RAGRetriever, pipe, top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD):
+#     hits = retriever.search(question, top_k=top_k)
+#     passages = retriever.get_passages(hits)
+#     top_score = hits[0][1] if hits else 0.0
 
-    # --- 핵심: 점수 낮으면 컨텍스트 제거 ---
-    use_context = (top_score >= score_threshold)
+#     # --- 핵심: 점수 낮으면 컨텍스트 제거 ---
+#     use_context = (top_score >= score_threshold)
+#     contexts = passages if use_context else []
+
+#     prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
+
+#     # 너 환경의 decode 정책 맞춤: 1차 greedy → 실패 시 샘플링
+#     is_mc, mc_num = is_multiple_choice(question)
+#     if is_mc:
+#         out = pipe(prompt, max_new_tokens=2, do_sample=False)
+#     else:
+#         out = pipe(prompt, max_new_tokens=256, do_sample=False)
+#     gen = out[0]["generated_text"]
+#     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
+#     if ans in ("0", "미응답"):
+#         if is_mc:
+#             outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95, 
+#                         num_return_sequences=3, repetition_penalty=1.05)
+#         else:
+#             outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95, 
+#                         num_return_sequences=3, repetition_penalty=1.05)
+#         picked = None
+#         for o in outs:
+#             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
+#             if cand not in ("0", "미응답"):
+#                 picked = cand
+#                 gen = o["generated_text"]
+#                 break
+
+#     # 간단 후처리(필요시 강화)
+#     # 객관식이면 숫자만, 주관식이면 문장 정리
+#     is_mc, _ = is_multiple_choice(question)
+#     if is_mc:
+#         # 가능한 숫자만 추출(1~99), 없으면 샘플링 재시도
+#         m = re.search(r"\b([1-9][0-9]?)\b", gen)
+#         if not m:
+#             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
+#             gen = out[0]["generated_text"]
+            
+#     return prompt, gen, passages, hits, use_context, contexts
+
+
+def answer_with_rag(
+    question: str,
+    retriever: RAGRetriever,
+    pipe,
+    top_k=TOP_K,
+    score_threshold: float = SCORE_THRESHOLD,   # 임베딩 검색용 임계값(폴백)
+    reranker: Optional["STReranker"] = None,       # ★ 추가: CrossEncoder reranker
+    rerank_threshold: float = 0.0,              # ★ 추가: reranker 점수 임계값
+    M_generic: int = 1,                        # ★ 추가: 전역 후보 수
+    M_filtered: int = 1,                       # ★ 추가: 법/조문 필터 후보 수
+):
+    import re, torch
+
+    # --- 1) 검색 ---
+    if reranker is not None:
+        # 혼합 검색(전역 + 명시적 법/조문 필터) → rerank
+        hits = retriever.search_mix_and_rerank(
+            question,
+            top_k=top_k,
+            M_generic=M_generic,
+            M_filtered=M_filtered,
+            reranker=reranker,
+        )
+        passages = retriever.get_passages(hits)
+        top_score = hits[0][1] if hits else float("-inf")  # reranker 점수
+        use_context = (len(hits) > 0) and (top_score >= rerank_threshold)
+    else:
+        # 기존 전역 검색
+        hits = retriever.search(question, top_k=top_k)
+        passages = retriever.get_passages(hits)
+        top_score = hits[0][1] if hits else 0.0            # 임베딩 유사도
+        use_context = (top_score >= score_threshold)
+
     contexts = passages if use_context else []
 
+    # --- 2) 프롬프트 ---
     prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
 
-    # 너 환경의 decode 정책 맞춤: 1차 greedy → 실패 시 샘플링
-    is_mc, mc_num = is_multiple_choice(question)
-    if is_mc:
-        out = pipe(prompt, max_new_tokens=2, do_sample=False)
-    else:
-        out = pipe(prompt, max_new_tokens=256, do_sample=False)
-    gen = out[0]["generated_text"]
+    # --- 3) 1차 생성 (greedy) ---
+    is_mc, _ = is_multiple_choice(question)
+    try:
+        if is_mc:
+            out = pipe(prompt, max_new_tokens=2, do_sample=False)
+        else:
+            out = pipe(prompt, max_new_tokens=256, do_sample=False)
+        gen = out[0]["generated_text"]
+    except Exception:
+        out = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95)
+        gen = out[0]["generated_text"]
+
+    # --- 4) 추출 실패 시 샘플링 백업 ---
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
     if ans in ("0", "미응답"):
         if is_mc:
-            outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95, 
+            outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95,
                         num_return_sequences=3, repetition_penalty=1.05)
         else:
-            outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95, 
+            outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95,
                         num_return_sequences=3, repetition_penalty=1.05)
-        picked = None
         for o in outs:
             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
             if cand not in ("0", "미응답"):
-                picked = cand
                 gen = o["generated_text"]
                 break
 
-    # 간단 후처리(필요시 강화)
-    # 객관식이면 숫자만, 주관식이면 문장 정리
-    is_mc, _ = is_multiple_choice(question)
+    # --- 5) 객관식 후처리: 숫자 강제 ---
     if is_mc:
-        # 가능한 숫자만 추출(1~99), 없으면 샘플링 재시도
         m = re.search(r"\b([1-9][0-9]?)\b", gen)
         if not m:
-            out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
+            out = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
-            
+
     return prompt, gen, passages, hits, use_context, contexts
+
 
 
 
@@ -626,74 +921,215 @@ def cmd_build(args):
     indexer.build_many(pdfs, INDEX_DIR)
 
 
+# def cmd_ask(args):
+#     pipe = load_model()
+#     retr = RAGRetriever(INDEX_DIR, device="cpu")
+#     q = args.question
+#     prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
+#         q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
+#     print("\n===== 생성된 답변 =====")
+#     print(gen)
+#     ans = extract_answer_only(gen, original_question=q, prompt=prompt)
+#     print("\n===== 채택된 답변 =====")
+#     print(ans)
+#     print("\n===== 검색 결과 요약 =====")
+#     if hits:
+#         print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
+#     else:
+#         print("검색 결과 없음 | context_used=False")
+#     if use_context:
+#         srcs = retr.get_sources(hits)
+#         print("\n===== 참고된 청크 (점수순) =====")
+#         for (idx, score), p, s in zip(hits, passages, srcs):
+#             print(f"\n[score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
+
 def cmd_ask(args):
+    import os
+    import torch
     pipe = load_model()
     retr = RAGRetriever(INDEX_DIR, device="cpu")
+
+    # --- Reranker 준비 (없으면 CPU로도 동작) ---
+    rr_model = getattr(args, "rerank_model", "BAAI/bge-reranker-v2-m3")
+    rr_device = "cuda" if torch.cuda.is_available() else "cpu"
+    reranker = STReranker(model_name=rr_model, device=rr_device, max_length=512)
+
+    # 하이퍼파라미터
+    top_k = getattr(args, "top_k", TOP_K)
+    score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)      # 임베딩 폴백용
+    rerank_threshold = getattr(args, "rerank_threshold", 0.0)          # reranker 컨텍스트 게이트
+    M_generic = getattr(args, "M_generic", 80)
+    M_filtered = getattr(args, "M_filtered", 80)
+
     q = args.question
+
+    # --- 혼합 검색 + rerank 사용 ---
     prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
-        q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
+        q,
+        retr,
+        pipe,
+        top_k=top_k,
+        score_threshold=score_threshold,
+        reranker=reranker,                 # ★ 중요: reranker 주입
+        rerank_threshold=rerank_threshold, # ★ 중요: rerank 임계값
+        M_generic=M_generic,
+        M_filtered=M_filtered,
+    )
+
     print("\n===== 생성된 답변 =====")
     print(gen)
     ans = extract_answer_only(gen, original_question=q, prompt=prompt)
     print("\n===== 채택된 답변 =====")
     print(ans)
+
     print("\n===== 검색 결과 요약 =====")
     if hits:
-        print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
+        # reranker 점수(상위1) 기준으로 표시
+        print(f"Top-1 rerank_score={hits[0][1]:.3f} | rerank_threshold={rerank_threshold:.2f} | context_used={use_context}")
     else:
         print("검색 결과 없음 | context_used=False")
+
     if use_context:
         srcs = retr.get_sources(hits)
         print("\n===== 참고된 청크 (점수순) =====")
         for (idx, score), p, s in zip(hits, passages, srcs):
-            print(f"\n[score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
+            print(f"\n[rerank_score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
+
+
+
+# def cmd_run(args):
+#     import pandas as pd
+#     pipe = load_model()
+#     retr = RAGRetriever(INDEX_DIR, device="cpu")
+#     df = pd.read_csv(args.csv)
+    
+#     preds = []
+#     context_flags = []         # context 사용 여부 (True/False)
+#     full_context = []          # context 원문
+#     generated_texts = []       # 출력값
+
+#     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
+#         prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
+#             q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
+#         # print(f"\n===== [문항{idx}] 생성된 답변 =====")
+#         # print(gen)
+#         # if hits:
+#         #     print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
+#         # else:
+#         #     print("검색 결과 없음 | context_used=False")
+#         ans = extract_answer_only(gen, original_question=q, prompt=prompt)
+        
+#         preds.append(ans)
+#         context_flags.append(bool(use_context))
+#         full_context.append(contexts)
+#         generated_texts.append(gen)
+    
+#     experiment_name = "result.csv"
+#     print("📄 제출 파일 생성 중...")
+#     sample_submission = pd.read_csv("data/sample_submission.csv")
+#     sample_submission['Answer'] = preds
+    
+#     os.makedirs(OUTPUT_PATH, exist_ok=True)
+#     sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
+#     print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
+
+#     # ----- 추가: context 사용 여부 + 생성 답변 포함한 보조 파일 저장 -----
+#     result_with_info = sample_submission.copy()
+#     result_with_info["ContextUsed"] = context_flags
+#     result_with_info["Contexts"] = full_context
+#     result_with_info["Generated"] = generated_texts
+
+#     result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
+#     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
+#     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
 
 
 def cmd_run(args):
+    import os
+    import re
+    import torch
     import pandas as pd
+
+    # 1) 모델/인덱스 로드
     pipe = load_model()
     retr = RAGRetriever(INDEX_DIR, device="cpu")
+
+    # 2) Reranker 준비 (없으면 CPU로도 동작)
+    rr_model = getattr(args, "rerank_model", "BAAI/bge-reranker-v2-m3")
+    rr_device = "cuda" if torch.cuda.is_available() else "cpu"
+    reranker = STReranker(model_name=rr_model, device=rr_device, max_length=800)
+
+    # 3) CSV 로드
     df = pd.read_csv(args.csv)
-    
+
     preds = []
     context_flags = []         # context 사용 여부 (True/False)
     full_context = []          # context 원문
     generated_texts = []       # 출력값
+    top_sources = []           # (디버깅) 선택된 패시지 소스
+    top_scores  = []           # (디버깅) reranker 또는 embed 스코어
 
+    # 하이퍼파라미터(없으면 기본값 사용)
+    top_k = getattr(args, "top_k", TOP_K)
+    score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)          # embed 검색 폴백용
+    rerank_threshold = getattr(args, "rerank_threshold", 0.0)              # reranker 점수 임계값
+    M_generic = getattr(args, "M_generic", 1)                              # 전역 후보 수
+    M_filtered = getattr(args, "M_filtered", 1)                            # 필터 후보 수
+
+    from tqdm import tqdm
     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
+        # === 핵심 변경: 혼합 검색 + rerank 사용 ===
         prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
-            q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
-        # print(f"\n===== [문항{idx}] 생성된 답변 =====")
-        # print(gen)
-        # if hits:
-        #     print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
-        # else:
-        #     print("검색 결과 없음 | context_used=False")
+            q,
+            retr,
+            pipe,
+            top_k=top_k,
+            score_threshold=score_threshold,
+            reranker=reranker,                 # ★ 추가
+            rerank_threshold=rerank_threshold, # ★ 추가
+            M_generic=M_generic,               # ★ 추가
+            M_filtered=M_filtered,             # ★ 추가
+        )
+
         ans = extract_answer_only(gen, original_question=q, prompt=prompt)
-        
+
         preds.append(ans)
         context_flags.append(bool(use_context))
         full_context.append(contexts)
         generated_texts.append(gen)
-    
+
+        # (옵션) 디버깅용 메타 저장
+        try:
+            srcs = retr.get_sources(hits)
+            top_sources.append(srcs[:top_k])
+            top_scores.append([float(s) for _, s in hits[:top_k]])
+        except Exception:
+            top_sources.append([])
+            top_scores.append([])
+
+    # 4) 제출 파일 저장
     experiment_name = "result.csv"
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv("data/sample_submission.csv")
     sample_submission['Answer'] = preds
-    
+
     os.makedirs(OUTPUT_PATH, exist_ok=True)
     sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
     print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
 
-    # ----- 추가: context 사용 여부 + 생성 답변 포함한 보조 파일 저장 -----
+    # 5) 부가 정보 저장
     result_with_info = sample_submission.copy()
     result_with_info["ContextUsed"] = context_flags
     result_with_info["Contexts"] = full_context
     result_with_info["Generated"] = generated_texts
+    result_with_info["TopSources"] = top_sources
+    result_with_info["TopScores"] = top_scores
 
     result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
+
+
 
 
 def main():

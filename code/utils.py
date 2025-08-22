@@ -60,34 +60,55 @@ def extract_question_and_choices(full_text):
 
 import re
 
+# 주신 STOP_MARKERS 그대로 사용
 STOP_MARKERS = [
-    "\n답변:", "\n---", "\n***",
+    "\n---", "\n***",
     "\n###", "\n[참고", "\n참고자료",
     "\n질문:", "\n[예시",
     "\n지시", "\nInstruction", "\nReferences", "\nAnswer:"
 ]
 
+_HANGUL = re.compile(r"[가-힣]")
+# 줄 시작(^) 또는 개행 뒤(\n) 등장하는 '답변:'도 경계로 사용
+_BOUNDARY_RE = re.compile(r"(^|\n)답변:|" + "|".join(map(re.escape, STOP_MARKERS)), re.MULTILINE)
 
-def _first_chunk_after_answer(text: str) -> str:
-    """'답변:' 이후 첫 블록 전체 반환"""
-    idx = text.find("답변:")
-    if idx != -1:
-        seg = text[idx + len("답변:"):].lstrip()
-    else:
-        seg = text.lstrip()
+def _has_korean(s: str) -> bool:
+    return _HANGUL.search(s) is not None
 
-    # '다음 답변:'이 다시 나오면 거기서 끊기
-    nxt = seg.find("답변:")
-    if nxt != -1:
-        seg = seg[:nxt]
+def _is_numeric_short(s: str) -> bool:
+    s = s.strip()
+    return s.isdigit() and 1 <= len(s) <= 2  # 1~99 같은 객관식 단답 허용
 
-    # 다른 STOP_MARKERS는 최소한만 적용
-    cut = len(seg)
-    for m in STOP_MARKERS:
-        k = seg.find(m)
-        if k != -1:
-            cut = min(cut, k)
-    return seg[:cut].strip()
+def _split_by_boundaries(text: str):
+    """STOP_MARKERS 또는 줄 시작의 '답변:'을 경계로 잘라, 마커 '사이'의 토막들을 순서대로 반환"""
+    parts = []
+    p = 0
+    for m in _BOUNDARY_RE.finditer(text):
+        if m.start() > p:
+            parts.append(text[p:m.start()])
+        p = m.end()  # 마커는 버리고 그 뒤부터 다음 토막 시작
+    if p < len(text):
+        parts.append(text[p:])
+    # 공백 제거 + 빈 토막 제거
+    return [seg.strip() for seg in parts if seg.strip()]
+
+def _first_chunk_after_answer(text: str, prompt: str = "") -> str:
+    """
+    1) 프롬프트 에코 제거
+    2) STOP_MARKERS 또는 줄 시작의 '답변:' 기준으로 토막
+    3) 앞에서부터 유효성(한국어 포함 or 숫자 단답) 검사, 첫 유효 토막 즉시 반환
+    4) 모두 무효면 첫 토막(있으면) 반환, 없으면 빈 문자열
+    """
+    t = text.lstrip()
+    if prompt and t.startswith(prompt):
+        t = t[len(prompt):].lstrip()
+
+    chunks = _split_by_boundaries(t)
+    for seg in chunks:
+        if _has_korean(seg) or _is_numeric_short(seg):
+            return seg
+    return chunks[0] if chunks else ""
+
 
 def extract_answer_only(generated_text: str, original_question: str, prompt: str) -> str:
     """
