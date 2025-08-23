@@ -10,7 +10,7 @@
     !python code/rag.py build --dir "laws/"
 
     # 2) 단일 질문
-    !python code/rag.py ask --question "정보보호의 3대 요소에 해당하는 보안 목표를 3가지 기술하세요."
+    !python code/rag.py ask --question "전자자금이체의 지급 효력 발생 시점을 전자금융거래법 기준에 따라 설명하세요."
     !python code/rag.py ask --question $'전자금융거래법 제44조에 따르면, 청문 절차가 필요한 경우는 무엇인가?\n1 전자금융거래의 중단\n2 전자금융거래의 보안 점검\n3 전자금융업자의 등록 취소\n4 전자금융거래의 수수료 변경'
     !python code/rag.py ask --question $'국내대리인이 법을 위반한 경우, 그 책임은 누구에게 있는가?\n1 국내대리인\n2 정부기관\n3 법원\n4 정보통신서비스 제공자\n5 개인정보 처리 위탁업체'
     !python code/rag.py ask --question $'개인정보보호법 제63조에 따르면, 보호위원회가 자료제출 요구 및 검사를 통해 수집한 서류나 자료를 제3자에게 제공하거나 일반에 공개할 수 있는 경우는?\n1 자료가 비밀이 아닌 경우\n2 개인정보처리자의 동의가 있는 경우\n3 정보주체가 개인정보 열람을 요청한 경우\n4 법에 따른 경우\n5 보호위원회의 내부 규정에 따른 경우'
@@ -50,8 +50,8 @@ from prompt import make_prompt_rag_exaone
 # 설정
 # -----------------------------
 INDEX_DIR = "./rag_index"
-INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
-META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
+# INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
+# META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
 CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
@@ -177,27 +177,19 @@ def load_pdf_text(pdf_path: str) -> str:
 # --- 법령 전용 분할기: '제n조(제n조의m)' 단위로 자르기 + 길면 항/호로 재분할 ---
 
 # --- 조 헤더 정규식: '제n조(…)' 또는 '제n조의m(…)' + 줄 시작 + 괄호 존재 보장 + '조제' 참조 제외 ---
-# 전각 괄호(（ ）)까지 허용
-ARTICLE_RE_STRICT = re.compile(
-    r'(?m)^'                                  # 줄 시작
-    r'(?P<header>' 
-       r'제\s*\d+\s*조'                        # 제n조
-       r'(?!\s*제)'                            # '조제…항' 참조는 제외
-       r'(?:\s*의\s*\d+)?'                     # '의m' (제n조의m) 허용
-    r')'
-    r'(?=\s*[（(])'                            # 바로 괄호가 존재해야 함(lookahead)
-    r'\s*[（(]'                                # 괄호 여는 기호 소모
-    r'(?P<title>[^）)]*)'                      # 제목(비워둘 수도 있음)
-    r'[）)]',                                  # 괄호 닫기
-    re.UNICODE
-)
 
-# 폴백: 혹시 일부 문서에서 괄호가 누락된 헤더가 존재하는 경우 대비
-ARTICLE_RE_FALLBACK = re.compile(
+# 제목 괄호를 반드시 요구(ASCII '(' ')' 또는 전각 '（' '）')
+ARTICLE_RE = re.compile(
     r'(?m)^'
-    r'(?P<header>제\s*\d+\s*조(?!\s*제)(?:\s*의\s*\d+)?)'
-    r'(?:\s*[（(](?P<title>[^）)]*)[）)])?',    # 괄호가 없어도 허용
-    re.UNICODE
+    r'(?P<header>'
+        r'제\s*\d+\s*조'          # 제n조
+        r'(?!\s*제)'              # '조제…항' 참조 제외
+        r'(?:\s*의\s*\d+)?'       # '의m' 허용(제n조의m)
+    r')'
+    r'\s*[（(]'                   # 여는 괄호(필수)
+    r'(?P<title>[^）)]+)'         # 제목(최소 1자)
+    r'[）)]'                      # 닫는 괄호
+    , re.UNICODE
 )
 
 # 항/호 마커 (다양한 표기 대응: ①②… / '1항' / '1.' 등)
@@ -207,44 +199,36 @@ PARA_SPLIT_RE = re.compile(
 
 def parse_korean_law_articles(raw_text: str):
     text = _clean_text(raw_text)
-
-    # 헤더가 줄 맨 앞에 떨어지도록 약간 정규화 (PDF 추출 잡음 완화)
-    # '제176조제3항' 같은 붙은 참조는 띄어쓰기 보정
+    # '제176조제3항' 같은 붙은 참조 띄어쓰기 보정(기존 유지)
     text = re.sub(r"(제\s*\d+\s*조)(\s*제\s*\d+\s*항)", r"\1 \2", text)
 
-    # 1) 엄격 규칙으로 시도(제목 괄호 필수)
-    matches = list(ARTICLE_RE_STRICT.finditer(text))
+    matches = list(ARTICLE_RE.finditer(text))  # 🔒 괄호 필수 정규식만 사용
     if not matches:
-        # 2) 괄호 없는 헤더가 섞인 문서 대응
-        matches = list(ARTICLE_RE_FALLBACK.finditer(text))
-        if not matches:
-            return [{"article": "전체", "title": "", "text": text}]
+        return [{"article": "전체", "title": "", "text": text}]
 
     articles = []
     for i, m in enumerate(matches):
         start = m.start()
         end = matches[i+1].start() if i+1 < len(matches) else len(text)
         header = m.group("header")
-        title = (m.groupdict().get("title") or "").strip()
-        body = text[start:end].strip()
+        title  = m.group("title").strip()      # 항상 존재
+        body   = text[start:end].strip()
 
-        # 헤더 행을 깔끔하게 앞줄로 정렬
-        head_full = header + (f"({title})" if title else "")
-        # 전각 괄호를 일반 괄호로 통일(보기도 좋고 후처리 쉬움)
-        head_full_alt = header + (f"（{title}）" if title else "")
+        head_full = f"{header}({title})"
+        head_full_alt = f"{header}（{title}）"
         body_norm = body
-        # 헤더 라벨 넣기
         if head_full in body_norm:
             body_norm = body_norm.replace(head_full, head_full + "\n", 1)
         elif head_full_alt in body_norm:
             body_norm = body_norm.replace(head_full_alt, head_full + "\n", 1)
 
         articles.append({
-            "article": header.replace(" ", ""),   # 예: "제11조", "제11조의2"
-            "title": title,
-            "text": body_norm.strip(),
+            "article": header.replace(" ", ""),   # 예: "제9조의2"
+            "title": title,                       # 예: "전자자금이체의 지급 효력 발생시기의 지연"
+            "text": body_norm,
         })
     return articles
+
 
 
 def split_article_if_long(article_text: str, max_len: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
@@ -343,109 +327,11 @@ class STReranker:
 # 인덱서/검색기
 # -----------------------------
 
-# class RAGIndexer:
-#     def __init__(self, model_name=MODEL_NAME, device=None):
-#         self.model_name = model_name
-#         self.embedder = E5Embedder(MODEL_NAME, device='cpu')
-
-#     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
-#         all_chunks, all_sources = [], []
-#         total = 0
-#         for pdf_path in pdf_paths:
-#             print(f"📄 PDF 읽는 중: {pdf_path}")
-#             raw = load_pdf_text(pdf_path)
-#             if not raw.strip():
-#                 raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
-
-#             print("🔪 '제n조' 단위 청크 분할 중...")
-#             chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
-
-#             base = os.path.basename(pdf_path)
-#             all_chunks.extend(chunks)
-#             # 소스에 파일명 + 조 라벨을 함께 저장 (검색 결과 설명에 바로 활용)
-#             all_sources.extend([f"{base}::{label}" for label in labels])
-#             total += len(chunks)
-#             print(f"  → {base}: 조/항 기준 {len(chunks)}개")
-
-#         if total == 0:
-#             raise ValueError("인덱싱할 청크가 없습니다.")
-
-#         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
-#         vectors = self.embedder.encode_passages(all_chunks)
-#         if vectors.shape[0] != len(all_chunks):
-#             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
-#         dim = vectors.shape[1]
-
-#         print("📦 FAISS 인덱스 생성/저장...")
-#         _ensure_dir(index_dir)
-#         index = faiss.IndexFlatIP(dim)  # L2 정규화된 코사인 유사도
-#         index.add(vectors)
-
-#         tmp_idx = INDEX_BIN + ".tmp"
-#         tmp_meta = META_PKL + ".tmp"
-#         faiss.write_index(index, tmp_idx)
-#         meta = {
-#             "chunks": all_chunks,
-#             "sources": all_sources,           # 예: "전자서명법.pdf::제22조(분쟁의 조정)#1"
-#             "model_name": self.model_name,
-#             "n_vectors": int(vectors.shape[0]),
-#         }
-#         with open(tmp_meta, "wb") as f:
-#             pickle.dump(meta, f)
-#         os.replace(tmp_idx, INDEX_BIN)
-#         os.replace(tmp_meta, META_PKL)
-
-#         print(f"✅ 저장 완료: {INDEX_BIN}, {META_PKL} | 총 청크 {total}개")
-
-
-
-# class RAGRetriever:
-#     def __init__(self, index_dir=INDEX_DIR, device=None):
-#         if not (os.path.exists(INDEX_BIN) and os.path.exists(META_PKL)):
-#             raise FileNotFoundError("인덱스가 없습니다. 먼저 `python rag.py build --pdf <path>`를 실행하세요.")
-#         self.index = faiss.read_index(INDEX_BIN)
-#         with open(META_PKL, "rb") as f:
-#             meta = pickle.load(f)
-#         self.chunks = list(meta["chunks"])
-#         self.sources = list(meta.get("sources", ["unknown"] * len(self.chunks)))
-#         self.model_name = meta.get("model_name", MODEL_NAME)
-#         self._n_meta = len(self.chunks)
-#         self._n_index = int(self.index.ntotal)
-#         # 불일치 보정(더 작은 쪽으로 자르기)
-#         expect = int(meta.get("n_vectors", self._n_meta))
-#         if expect != self._n_index or self._n_meta != self._n_index:
-#             print(f"⚠️ meta/Index 불일치. meta.chunks={self._n_meta}, meta.n_vectors={expect}, index.ntotal={self._n_index}. "
-#                   f"{min(self._n_meta, self._n_index)}개로 보정합니다.")
-#             n = min(self._n_meta, self._n_index)
-#             self.chunks = self.chunks[:n]
-#             self.sources = self.sources[:n]
-#             self._n_meta = n
-#             self._n_index = n
-
-#         # 검색시 사용할 동일 임베더 로드
-#         self.embedder = E5Embedder(MODEL_NAME, device='cpu')
-
-#     def search(self, query: str, top_k=TOP_K) -> List[Tuple[int, float]]:
-#         q_emb = self.embedder.encode_queries([query]).astype("float32")
-#         k = min(int(top_k), self._n_index) if self._n_index > 0 else 0
-#         if k <= 0:
-#             return []
-#         D, I = self.index.search(q_emb, k)
-#         raw = list(zip(I[0].tolist(), D[0].tolist()))
-#         # 유효 인덱스만 필터(-1/범위 초과 제거)
-#         results = [(idx, float(score)) for idx, score in raw if (0 <= idx < self._n_meta)]
-#         return results
-
-#     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
-#         return [self.chunks[i] for i, _ in hits]
-
-#     def get_sources(self, hits: List[Tuple[int, float]]) -> List[str]:
-#         return [self.sources[i] for i, _ in hits]
-
-
 
 _ART_RE = re.compile(r"제\s*(\d+)\s*조(?:\s*의\s*(\d+))?", re.UNICODE)  # 제22조의2 → (22, 2)
 _CLAUSE_RE = re.compile(r"(?:제)?\s*(\d+)\s*항")
+LABEL_RE = re.compile(r'^(제\s*\d+\s*조(?:\s*의\s*\d+)?)(?:\(([^)]*)\))?#(\d+)$')
+
 
 def _norm_law_name_from_filename(base: str) -> str:
     name = os.path.splitext(base)[0]
@@ -498,15 +384,37 @@ class RAGIndexer:
             base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
             all_sources.extend([f"{base}::{label}" for label in labels])
+
             # ★ 추가: 라벨→메타 파싱 + 법령명 주입
             law_name = _norm_law_name_from_filename(base)
+            
             for lbl in labels:
-                m = _parse_label_to_meta(lbl)
-                m.update({
-                    "law": law_name,                # 필터에 쓸 법령명
-                    "source": f"{base}::{lbl}",     # 표시용
-                })
-                metas.append(_sanitize_meta(m))
+                # lbl 예: "제11조(다른 법률의 개정)#2" 또는 "제11조#1"
+                m_lbl = LABEL_RE.match(lbl)
+                if m_lbl:
+                    article_label = m_lbl.group(1).replace(" ", "")             # "제11조" / "제11조의2"
+                    article_title = (m_lbl.group(2) or "").strip()              # "다른 법률의 개정" / ""
+                    chunk_index   = int(m_lbl.group(3))
+                else:
+                    article_label, article_title, chunk_index = None, "", None
+            
+                m_art = _ART_RE.search(article_label or "")
+                article_num = int(m_art.group(1)) if m_art else None
+                article_bis = int(m_art.group(2)) if (m_art and m_art.group(2)) else None
+                article_key = str(article_num) + (f"-{article_bis}" if article_bis else "") if article_num else None
+            
+                metas.append(_sanitize_meta({
+                    "law": law_name,                       # 필터용 법령명
+                    "source": f"{base}::{lbl}",            # 사람이 보기 쉬운 원본 라벨
+                    "article_label": article_label,        # "제11조" / "제11조의2"
+                    "article_title": article_title,        # 제목(없으면 빈 문자열)
+                    "article_num": article_num,            # 11
+                    "article_bis": article_bis,            # 2 (없으면 None)
+                    "article_key": article_key,            # "11" / "11-2"
+                    "chunk_index": chunk_index,            # 1부터 시작
+                    # "clause": None,  # 항/호까지 필요하면 분할 시점에 넣는 게 정확
+                }))
+
             total += len(chunks)
             print(f"  → {base}: 조/항 기준 {len(chunks)}개")
 
@@ -626,12 +534,15 @@ class RAGRetriever:
             self._n_index = n
             self._n_meta = n
 
-    
+
     def _where_all(self, **kv):
         terms = [{k: v} for k, v in kv.items() if v is not None]
         if not terms:
             return None
-        return {"$and": terms}
+        if len(terms) == 1:
+            return terms[0]              # ✅ 단일 조건은 그대로 반환 (예: {"law": "..."} )
+        return {"$and": terms}           # ✅ 2개 이상일 때만 $and
+
     
     def _to_hits(self, res):
         """
@@ -689,6 +600,7 @@ class RAGRetriever:
         law, a_num, a_bis, clause, _article_key = _extract_explicit_law_and_article(query)
         hits_filtered = []
         if law and (a_num is not None):
+            # (기존 그대로) 조/조의 [+ 항] 필터
             where = self._where_all(law=law, article_num=a_num, article_bis=a_bis)
             if use_clause and (clause is not None):
                 where_clause = self._where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
@@ -697,7 +609,6 @@ class RAGRetriever:
                     where=where_clause, include=["distances"]
                 )
                 hits_filtered = self._to_hits(res_f1)
-                # 항으로 너무 좁아서 부족하면 조문 수준으로 보충
                 if len(hits_filtered) < min(M_filtered, self._n_index):
                     res_f2 = self.collection.query(
                         query_embeddings=q_emb, n_results=min(M_filtered, self._n_index),
@@ -710,6 +621,18 @@ class RAGRetriever:
                     where=where, include=["distances"]
                 )
                 hits_filtered = self._to_hits(res_f)
+        
+        elif law:
+            # ✅ 추가: 법령명만 명시된 경우에도 해당 법령으로 1차 좁히기
+            where_law = self._where_all(law=law)
+            res_law = self.collection.query(
+                query_embeddings=q_emb,
+                n_results=min(M_filtered, self._n_index),
+                where=where_law,
+                include=["distances"],
+            )
+            hits_filtered = self._to_hits(res_law)
+
     
         # --- 3) 후보 합치기(중복 제거)
         # idx 기준 dedup, 우선순위는 filtered > global (동일 idx면 한 번만)
@@ -747,30 +670,38 @@ class RAGRetriever:
         
         # 1) 명시적 법 + '조'(및 '조의')가 있으면 '숫자'로 필터
         if law and a_num is not None:
-            where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
+            where = self._where_all(law=law, article_num=a_num, article_bis=a_bis)
             # (선택) 항까지 있으면 더 좁히기 시도
             if clause is not None:
-                where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
+                where_clause = self._where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
                 res = self.collection.query(query_embeddings=q_emb, n_results=k, where=where_clause, include=["distances"])
-                hits = _to_hits(res)
+                hits = self._to_hits(res)
                 if hits:   # 최소 1건 나오면 여기서 반환
                     # 부족하면 같은 조문(where)로 보충
                     if len(hits) < k:
                         res2 = self.collection.query(query_embeddings=q_emb, n_results=k, where=where, include=["distances"])
-                        more = _to_hits(res2)
+                        more = self._to_hits(res2)
                         seen = {i for i, _ in hits}
                         hits.extend([(i, s) for i, s in more if i not in seen])
                         hits = sorted(hits, key=lambda x: x[1], reverse=True)[:k]
                     return hits
             # 항이 없거나 0건이면 조문 수준으로 재시도
             res = self.collection.query(query_embeddings=q_emb, n_results=k, where=where, include=["distances"])
-            hits = _to_hits(res)
+            hits = self._to_hits(res)
             if hits:
                 return hits
-        
+
+        # ✅ 추가: 법령명만 있을 때는 법령 필터로 한 번 좁혀본다
+        if law:
+            where_law = self._where_all(law=law)
+            res_law = self.collection.query(query_embeddings=q_emb, n_results=k, where=where_law, include=["distances"])
+            hits = self._to_hits(res_law)
+            if hits:
+                return hits
+                
         # 2) 필터 결과가 0이면 전역 검색 폴백 (원래대로)
         res = self.collection.query(query_embeddings=q_emb, n_results=k, include=["distances"])
-        return _to_hits(res)
+        return self._to_hits(res)
 
 
 
@@ -785,53 +716,6 @@ class RAGRetriever:
 # -----------------------------
 # RAG 추론 함수
 # -----------------------------
-
-# def answer_with_rag(
-#     question: str, retriever: RAGRetriever, pipe, top_k=TOP_K, score_threshold: float = SCORE_THRESHOLD):
-#     hits = retriever.search(question, top_k=top_k)
-#     passages = retriever.get_passages(hits)
-#     top_score = hits[0][1] if hits else 0.0
-
-#     # --- 핵심: 점수 낮으면 컨텍스트 제거 ---
-#     use_context = (top_score >= score_threshold)
-#     contexts = passages if use_context else []
-
-#     prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
-
-#     # 너 환경의 decode 정책 맞춤: 1차 greedy → 실패 시 샘플링
-#     is_mc, mc_num = is_multiple_choice(question)
-#     if is_mc:
-#         out = pipe(prompt, max_new_tokens=2, do_sample=False)
-#     else:
-#         out = pipe(prompt, max_new_tokens=256, do_sample=False)
-#     gen = out[0]["generated_text"]
-#     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
-#     if ans in ("0", "미응답"):
-#         if is_mc:
-#             outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95, 
-#                         num_return_sequences=3, repetition_penalty=1.05)
-#         else:
-#             outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95, 
-#                         num_return_sequences=3, repetition_penalty=1.05)
-#         picked = None
-#         for o in outs:
-#             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
-#             if cand not in ("0", "미응답"):
-#                 picked = cand
-#                 gen = o["generated_text"]
-#                 break
-
-#     # 간단 후처리(필요시 강화)
-#     # 객관식이면 숫자만, 주관식이면 문장 정리
-#     is_mc, _ = is_multiple_choice(question)
-#     if is_mc:
-#         # 가능한 숫자만 추출(1~99), 없으면 샘플링 재시도
-#         m = re.search(r"\b([1-9][0-9]?)\b", gen)
-#         if not m:
-#             out = pipe(prompt, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
-#             gen = out[0]["generated_text"]
-            
-#     return prompt, gen, passages, hits, use_context, contexts
 
 
 def answer_with_rag(
@@ -929,27 +813,6 @@ def cmd_build(args):
     indexer.build_many(pdfs, INDEX_DIR)
 
 
-# def cmd_ask(args):
-#     pipe = load_model()
-#     retr = RAGRetriever(INDEX_DIR, device="cpu")
-#     q = args.question
-#     prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
-#         q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
-#     print("\n===== 생성된 답변 =====")
-#     print(gen)
-#     ans = extract_answer_only(gen, original_question=q, prompt=prompt)
-#     print("\n===== 채택된 답변 =====")
-#     print(ans)
-#     print("\n===== 검색 결과 요약 =====")
-#     if hits:
-#         print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
-#     else:
-#         print("검색 결과 없음 | context_used=False")
-#     if use_context:
-#         srcs = retr.get_sources(hits)
-#         print("\n===== 참고된 청크 (점수순) =====")
-#         for (idx, score), p, s in zip(hits, passages, srcs):
-#             print(f"\n[score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
 
 def cmd_ask(args):
     import os
@@ -1003,53 +866,6 @@ def cmd_ask(args):
         for (idx, score), p, s in zip(hits, passages, srcs):
             print(f"\n[rerank_score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
 
-
-
-# def cmd_run(args):
-#     import pandas as pd
-#     pipe = load_model()
-#     retr = RAGRetriever(INDEX_DIR, device="cpu")
-#     df = pd.read_csv(args.csv)
-    
-#     preds = []
-#     context_flags = []         # context 사용 여부 (True/False)
-#     full_context = []          # context 원문
-#     generated_texts = []       # 출력값
-
-#     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
-#         prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
-#             q, retr, pipe, top_k=args.top_k, score_threshold=args.threshold)
-#         # print(f"\n===== [문항{idx}] 생성된 답변 =====")
-#         # print(gen)
-#         # if hits:
-#         #     print(f"Top-1 score={hits[0][1]:.3f} | threshold={args.threshold:.2f} | context_used={use_context}")
-#         # else:
-#         #     print("검색 결과 없음 | context_used=False")
-#         ans = extract_answer_only(gen, original_question=q, prompt=prompt)
-        
-#         preds.append(ans)
-#         context_flags.append(bool(use_context))
-#         full_context.append(contexts)
-#         generated_texts.append(gen)
-    
-#     experiment_name = "result.csv"
-#     print("📄 제출 파일 생성 중...")
-#     sample_submission = pd.read_csv("data/sample_submission.csv")
-#     sample_submission['Answer'] = preds
-    
-#     os.makedirs(OUTPUT_PATH, exist_ok=True)
-#     sample_submission.to_csv(OUTPUT_PATH + experiment_name, index=False, encoding='utf-8-sig')
-#     print(f"✅ 제출 파일 저장 완료: {OUTPUT_PATH + experiment_name}")
-
-#     # ----- 추가: context 사용 여부 + 생성 답변 포함한 보조 파일 저장 -----
-#     result_with_info = sample_submission.copy()
-#     result_with_info["ContextUsed"] = context_flags
-#     result_with_info["Contexts"] = full_context
-#     result_with_info["Generated"] = generated_texts
-
-#     result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
-#     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
-#     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
 
 
 def cmd_run(args):
