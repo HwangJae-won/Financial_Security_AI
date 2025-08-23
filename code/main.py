@@ -79,8 +79,8 @@ def main_rerank():
         
     submission_df = pd.read_csv(os.path.join(DATA_PATH, "sample_submission.csv"))
     submission_df['Answer'] = preds
-    submission_df.to_csv(os.path.join(OUTPUT_PATH, "exaone_rerank_v2.csv"), index=False, encoding='utf-8-sig')
-    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'exaone_rerank_v2.csv')}")
+    submission_df.to_csv(os.path.join(OUTPUT_PATH, "exaone_rerank_v3.csv"), index=False, encoding='utf-8-sig')
+    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'exaone_rerank_v3.csv')}")
     print("--- ✅ 모든 작업 완료 ---")
     
 def main():
@@ -121,8 +121,8 @@ def main():
         
     submission_df = pd.read_csv(os.path.join(DATA_PATH, "sample_submission.csv"))
     submission_df['Answer'] = preds
-    submission_df.to_csv(os.path.join(OUTPUT_PATH, "rerank_add.csv"), index=False, encoding='utf-8-sig')
-    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'rerank_add.csv')}")
+    submission_df.to_csv(os.path.join(OUTPUT_PATH, "exaone_rerank_v4.csv"), index=False, encoding='utf-8-sig')
+    print(f"✅ 제출 파일 저장 완료: {os.path.join(OUTPUT_PATH, 'exaone_rerank_v4.csv')}")
     print("--- ✅ 모든 작업 완료 ---")
 
 

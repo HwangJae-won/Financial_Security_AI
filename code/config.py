@@ -11,8 +11,8 @@ LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
 CACHE_DIR = "/dev/shm/models/EXAONE-Deep-7.8B"
 TMP_DIR = "/dev/shm/tmp"
 CHROMA_PERSIST_DIRECTORY = "chroma_db"
-TOP_K = 30
-SCORE_THRESHOLD = 0.85
+TOP_K = 1
+SCORE_THRESHOLD = 0.89
 
 
 # 실험/참고용 모델

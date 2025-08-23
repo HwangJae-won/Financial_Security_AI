@@ -27,7 +27,7 @@ def load_llm_and_tokenizer(model_name, cache_dir):
     return model, tokenizer
 
 from sentence_transformers import CrossEncoder # Reranker 모델 import
-def load_reranker_model(model_name: str = "Dongjin-kr/ko-reranker"):
+def load_reranker_model(model_name: str = "Alibaba-NLP/gte-multilingual-reranker-base"):
     """
     리랭커 모델을 로드합니다.
     """
