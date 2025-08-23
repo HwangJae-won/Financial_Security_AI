@@ -53,7 +53,7 @@ INDEX_DIR = "./rag_index"
 INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
 META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
-CHUNK_SIZE = 800        # 청크 길이(문자 수 기준)
+CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
 TOP_K = 1             # 검색 상위 k개
 
@@ -200,9 +200,9 @@ ARTICLE_RE_FALLBACK = re.compile(
     re.UNICODE
 )
 
-# 항/호 마커 (다양한 표기 대응: ①②… / '1항' / '1.' / '가.' / 괄호 숫자 등)
+# 항/호 마커 (다양한 표기 대응: ①②… / '1항' / '1.' 등)
 PARA_SPLIT_RE = re.compile(
-    r'(?m)^(?=(?:[①-⑳]|[0-9]+\.?\s*항|[0-9]+\)|[가-하]\.|[ㄱ-ㅎ]\)|\([0-9]+\)|\([가-하]\)))'
+    r'(?m)^(?=(?:[①-⑳]|[0-9]+\.?\s*항|[0-9]+\)))'
 )
 
 def parse_korean_law_articles(raw_text: str):
@@ -841,14 +841,14 @@ def answer_with_rag(
     top_k=TOP_K,
     score_threshold: float = SCORE_THRESHOLD,   # 임베딩 검색용 임계값(폴백)
     reranker: Optional["STReranker"] = None,       # ★ 추가: CrossEncoder reranker
-    rerank_threshold: float = 0.3,              # ★ 추가: reranker 점수 임계값
+    rerank_threshold: float = 0.0,              # ★ 추가: reranker 점수 임계값
     M_generic: int = 1,                        # ★ 추가: 전역 후보 수
     M_filtered: int = 1,                       # ★ 추가: 법/조문 필터 후보 수
 ):
-    import re, torch
-
+    
+    is_mc, _ = is_multiple_choice(question)
     # --- 1) 검색 ---
-    if reranker is not None:
+    if reranker is not None and is_mc:
         # 혼합 검색(전역 + 명시적 법/조문 필터) → rerank
         hits = retriever.search_mix_and_rerank(
             question,
@@ -873,7 +873,7 @@ def answer_with_rag(
     prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
 
     # --- 3) 1차 생성 (greedy) ---
-    is_mc, _ = is_multiple_choice(question)
+    
     try:
         if is_mc:
             out = pipe(prompt, max_new_tokens=2, do_sample=False)
@@ -965,7 +965,7 @@ def cmd_ask(args):
     # 하이퍼파라미터
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)      # 임베딩 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", 0.3)          # reranker 컨텍스트 게이트
+    rerank_threshold = getattr(args, "rerank_threshold", 0.0)          # reranker 컨텍스트 게이트
     M_generic = getattr(args, "M_generic", 1)
     M_filtered = getattr(args, "M_filtered", 1)
 
@@ -1080,7 +1080,7 @@ def cmd_run(args):
     # 하이퍼파라미터(없으면 기본값 사용)
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)          # embed 검색 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", 0.3)              # reranker 점수 임계값
+    rerank_threshold = getattr(args, "rerank_threshold", 0.0)              # reranker 점수 임계값
     M_generic = getattr(args, "M_generic", 1)                              # 전역 후보 수
     M_filtered = getattr(args, "M_filtered", 1)                            # 필터 후보 수
 
