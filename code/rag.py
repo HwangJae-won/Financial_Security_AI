@@ -1,10 +1,6 @@
 # rag.py
 # -*- coding: utf-8 -*-
 """
-- PDF → 텍스트 청크 → 임베딩 → FAISS 인덱스 생성/저장
-- 질문 시 상위 k개 청크 검색 후, 컨텍스트를 포함한 프롬프트로 LLM 호출
-
-사용 예:
     # 1) 인덱스 빌드
     !python code/rag.py build --pdf "data/전자금융거래법(법률)(제19734호)(20240915).pdf"
     !python code/rag.py build --dir "laws/"
@@ -50,8 +46,6 @@ from prompt import make_prompt_rag_exaone
 # 설정
 # -----------------------------
 INDEX_DIR = "./rag_index"
-# INDEX_BIN = os.path.join(INDEX_DIR, "faiss.index")
-# META_PKL = os.path.join(INDEX_DIR, "meta.pkl")
 MODEL_NAME = "/workspace/models/multilingual-e5-small"   # 한글 안정: e5-base 다국어
 CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
@@ -566,7 +560,33 @@ class RAGRetriever:
             sim = 1.0 - float(dist)  # cosine distance -> similarity
             out.append((idx, sim))
         return out
-        
+
+    # RAGRetriever 내부 메서드로 추가
+    def _format_for_rerank(self, i: int) -> str:
+        """리랭커에 넣을 passage 앞에 [법][조][제목] 헤더를 붙인다."""
+        # 메타 안전 접근
+        meta = {}
+        try:
+            if hasattr(self, "metadatas") and self.metadatas:
+                meta = self.metadatas[i] or {}
+        except Exception:
+            meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+    
+        law   = (meta.get("law") or "").strip()
+        albl  = (meta.get("article_label") or meta.get("article") or "").strip()
+        atitle= (meta.get("article_title") or meta.get("title") or "").strip()
+    
+        head = " ".join(p for p in [
+            f"[법:{law}]"     if law   else "",
+            f"[조:{albl}]"    if albl  else "",
+            f"[제목:{atitle}]"if atitle else "",
+        ] if p)
+    
+        body = self.chunks[i]
+        return (head + "\n" if head else "") + body
+
     def search_mix_and_rerank(
         self,
         query: str,
@@ -648,15 +668,18 @@ class RAGRetriever:
     
         # --- 4) Rerank (없으면 combined 유사도 점수 그대로 정렬)
         if reranker is None:
-            # 기존 유사도(sim) 기준 내림차순 후 Top-K
             combined.sort(key=lambda x: x[1], reverse=True)
             return combined[:k]
-    
-        passages = [self.chunks[i] for i, _ in combined]
-        scores = reranker.score(query, passages, batch_size=32)
-        # reranker 점수로 재정렬
-        reranked = sorted(zip([i for i, _ in combined], scores), key=lambda x: x[1], reverse=True)
-        # Top-K 반환: (idx, rerank_score)
+        
+        # ✅ 헤더 주입한 passage로 리랭크
+        aug_passages = [self._format_for_rerank(i) for i, _ in combined]
+        scores = reranker.score(query, aug_passages, batch_size=32)
+        
+        reranked = sorted(
+            zip([i for i, _ in combined], scores),
+            key=lambda x: x[1],
+            reverse=True
+        )
         return reranked[:k]
     
     # === RAGRetriever 내부 ===
@@ -746,7 +769,7 @@ def answer_with_rag(
         use_context = (len(hits) > 0) and (top_score >= rerank_threshold)
     else:
         # 기존 전역 검색
-        hits = retriever.search(question, top_k=top_k)
+        hits = retriever.search(question, top_k=2)
         passages = retriever.get_passages(hits)
         top_score = hits[0][1] if hits else 0.0            # 임베딩 유사도
         use_context = (top_score >= score_threshold)
