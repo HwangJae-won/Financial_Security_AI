@@ -18,49 +18,8 @@ def extract_question_and_choices(full_text):
     question = " ".join(q_lines)
     return question, options
     
-# def extract_answer_only(generated_text: str, original_question: str, prompt: str) -> str:
-#     """
-#     - "답변:" 이후 텍스트만 추출
-#     - 객관식 문제면: 정답 숫자만 추출 (실패 시 전체 텍스트 또는 기본값 반환)
-#     - 주관식 문제면: 전체 텍스트 그대로 반환
-#     - 공백 또는 빈 응답 방지: 최소 "미응답" 반환
-#     - 모델의 출력에서 프롬프트가 반복되는 부분을 제거
-#     """
-#     # 1. generated_text의 시작 부분에서 prompt를 찾아 제거
-#     if generated_text.startswith(prompt):
-#         text = generated_text[len(prompt):].strip()
-#     else:
-#         text = generated_text.strip()
 
-#     # 2. "답변:" 기준으로 텍스트 분리 (기존 로직 유지)
-#     if "답변:" in text:
-#         text = text.split("답변:")[-1].strip()
-    
-#     # 3. 공백 또는 빈 문자열일 경우 기본값 지정
-#     if not text:
-#         text = "미응답"
 
-#     # 4. 객관식 여부 판단
-#     is_mc, option_count = is_multiple_choice(original_question)
-
-#     if is_mc:
-#         # 숫자만 추출 (기존 로직 유지)
-#         match = re.match(r"\D*([1-9][0-9]?)", text)
-#         if match:
-#             num = int(match.group(1))
-#             if 1 <= num <= option_count:   # 선택지 이상이면 무효 처리
-#                 return str(num)
-#             else:
-#                 return '0'
-#         else:
-#             return '0'
-#     else:
-#         # 주관식 답변은 그대로 반환 (기존 로직 유지)
-#         return text
-
-import re
-
-# 주신 STOP_MARKERS 그대로 사용
 STOP_MARKERS = [
     "\n---", "\n***",
     "\n###", "\n[참고", "\n참고자료",

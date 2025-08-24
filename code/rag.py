@@ -55,7 +55,6 @@ SCORE_THRESHOLD = 0.89
 OUTPUT_PATH = "results/"
 
 
-
 os.environ["ANONYMIZED_TELEMETRY"] = "false"      # 크로마 텔레메트리 끄기
 # 혹시 환경에 따라 아래 키도 지원됩니다(둘 다 넣어도 무해).
 os.environ["CHROMADB_TELEMETRY_ENABLED"] = "false"
@@ -66,14 +65,13 @@ import chromadb
 from chromadb import PersistentClient
 
 # Chroma 영구 저장 경로와 컬렉션 이름
-CHROMA_DIR = Path(INDEX_DIR) / "chroma"     # 기존 INDEX_DIR 활용
 CHROMA_COLLECTION = "rag_index"  
 
-
+RERANK_THRESHOLD = 0.0
+M_GENERIC = 1
+M_FILTERED = 1
 
 # ---- E5 임베딩 클래스 (sentence-transformers 버전) ----
-from sentence_transformers import SentenceTransformer
-import numpy as np
 
 class E5Embedder:
     """
@@ -171,19 +169,27 @@ def load_pdf_text(pdf_path: str) -> str:
 # --- 법령 전용 분할기: '제n조(제n조의m)' 단위로 자르기 + 길면 항/호로 재분할 ---
 
 # --- 조 헤더 정규식: '제n조(…)' 또는 '제n조의m(…)' + 줄 시작 + 괄호 존재 보장 + '조제' 참조 제외 ---
-
-# 제목 괄호를 반드시 요구(ASCII '(' ')' 또는 전각 '（' '）')
-ARTICLE_RE = re.compile(
-    r'(?m)^'
-    r'(?P<header>'
-        r'제\s*\d+\s*조'          # 제n조
-        r'(?!\s*제)'              # '조제…항' 참조 제외
-        r'(?:\s*의\s*\d+)?'       # '의m' 허용(제n조의m)
+# 전각 괄호(（ ）)까지 허용
+ARTICLE_RE_STRICT = re.compile(
+    r'(?m)^'                                  # 줄 시작
+    r'(?P<header>' 
+       r'제\s*\d+\s*조'                        # 제n조
+       r'(?!\s*제)'                            # '조제…항' 참조는 제외
+       r'(?:\s*의\s*\d+)?'                     # '의m' (제n조의m) 허용
     r')'
-    r'\s*[（(]'                   # 여는 괄호(필수)
-    r'(?P<title>[^）)]+)'         # 제목(최소 1자)
-    r'[）)]'                      # 닫는 괄호
-    , re.UNICODE
+    r'(?=\s*[（(])'                            # 바로 괄호가 존재해야 함(lookahead)
+    r'\s*[（(]'                                # 괄호 여는 기호 소모
+    r'(?P<title>[^）)]*)'                      # 제목(비워둘 수도 있음)
+    r'[）)]',                                  # 괄호 닫기
+    re.UNICODE
+)
+
+# 폴백: 혹시 일부 문서에서 괄호가 누락된 헤더가 존재하는 경우 대비
+ARTICLE_RE_FALLBACK = re.compile(
+    r'(?m)^'
+    r'(?P<header>제\s*\d+\s*조(?!\s*제)(?:\s*의\s*\d+)?)'
+    r'(?:\s*[（(](?P<title>[^）)]*)[）)])?',    # 괄호가 없어도 허용
+    re.UNICODE
 )
 
 # 항/호 마커 (다양한 표기 대응: ①②… / '1항' / '1.' 등)
@@ -193,33 +199,42 @@ PARA_SPLIT_RE = re.compile(
 
 def parse_korean_law_articles(raw_text: str):
     text = _clean_text(raw_text)
-    # '제176조제3항' 같은 붙은 참조 띄어쓰기 보정(기존 유지)
+
+    # 헤더가 줄 맨 앞에 떨어지도록 약간 정규화 (PDF 추출 잡음 완화)
+    # '제176조제3항' 같은 붙은 참조는 띄어쓰기 보정
     text = re.sub(r"(제\s*\d+\s*조)(\s*제\s*\d+\s*항)", r"\1 \2", text)
 
-    matches = list(ARTICLE_RE.finditer(text))  # 🔒 괄호 필수 정규식만 사용
+    # 1) 엄격 규칙으로 시도(제목 괄호 필수)
+    matches = list(ARTICLE_RE_STRICT.finditer(text))
     if not matches:
-        return [{"article": "전체", "title": "", "text": text}]
+        # 2) 괄호 없는 헤더가 섞인 문서 대응
+        matches = list(ARTICLE_RE_FALLBACK.finditer(text))
+        if not matches:
+            return [{"article": "전체", "title": "", "text": text}]
 
     articles = []
     for i, m in enumerate(matches):
         start = m.start()
         end = matches[i+1].start() if i+1 < len(matches) else len(text)
         header = m.group("header")
-        title  = m.group("title").strip()      # 항상 존재
-        body   = text[start:end].strip()
+        title = (m.groupdict().get("title") or "").strip()
+        body = text[start:end].strip()
 
-        head_full = f"{header}({title})"
-        head_full_alt = f"{header}（{title}）"
+        # 헤더 행을 깔끔하게 앞줄로 정렬
+        head_full = header + (f"({title})" if title else "")
+        # 전각 괄호를 일반 괄호로 통일(보기도 좋고 후처리 쉬움)
+        head_full_alt = header + (f"（{title}）" if title else "")
         body_norm = body
+        # 헤더 라벨 넣기
         if head_full in body_norm:
             body_norm = body_norm.replace(head_full, head_full + "\n", 1)
         elif head_full_alt in body_norm:
             body_norm = body_norm.replace(head_full_alt, head_full + "\n", 1)
 
         articles.append({
-            "article": header.replace(" ", ""),   # 예: "제9조의2"
-            "title": title,                       # 예: "전자자금이체의 지급 효력 발생시기의 지연"
-            "text": body_norm,
+            "article": header.replace(" ", ""),   # 예: "제11조", "제11조의2"
+            "title": title,
+            "text": body_norm.strip(),
         })
     return articles
 
@@ -324,8 +339,6 @@ class STReranker:
 
 _ART_RE = re.compile(r"제\s*(\d+)\s*조(?:\s*의\s*(\d+))?", re.UNICODE)  # 제22조의2 → (22, 2)
 _CLAUSE_RE = re.compile(r"(?:제)?\s*(\d+)\s*항")
-LABEL_RE = re.compile(r'^(제\s*\d+\s*조(?:\s*의\s*\d+)?)(?:\(([^)]*)\))?#(\d+)$')
-
 
 def _norm_law_name_from_filename(base: str) -> str:
     name = os.path.splitext(base)[0]
@@ -378,37 +391,15 @@ class RAGIndexer:
             base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
             all_sources.extend([f"{base}::{label}" for label in labels])
-
             # ★ 추가: 라벨→메타 파싱 + 법령명 주입
             law_name = _norm_law_name_from_filename(base)
-            
             for lbl in labels:
-                # lbl 예: "제11조(다른 법률의 개정)#2" 또는 "제11조#1"
-                m_lbl = LABEL_RE.match(lbl)
-                if m_lbl:
-                    article_label = m_lbl.group(1).replace(" ", "")             # "제11조" / "제11조의2"
-                    article_title = (m_lbl.group(2) or "").strip()              # "다른 법률의 개정" / ""
-                    chunk_index   = int(m_lbl.group(3))
-                else:
-                    article_label, article_title, chunk_index = None, "", None
-            
-                m_art = _ART_RE.search(article_label or "")
-                article_num = int(m_art.group(1)) if m_art else None
-                article_bis = int(m_art.group(2)) if (m_art and m_art.group(2)) else None
-                article_key = str(article_num) + (f"-{article_bis}" if article_bis else "") if article_num else None
-            
-                metas.append(_sanitize_meta({
-                    "law": law_name,                       # 필터용 법령명
-                    "source": f"{base}::{lbl}",            # 사람이 보기 쉬운 원본 라벨
-                    "article_label": article_label,        # "제11조" / "제11조의2"
-                    "article_title": article_title,        # 제목(없으면 빈 문자열)
-                    "article_num": article_num,            # 11
-                    "article_bis": article_bis,            # 2 (없으면 None)
-                    "article_key": article_key,            # "11" / "11-2"
-                    "chunk_index": chunk_index,            # 1부터 시작
-                    # "clause": None,  # 항/호까지 필요하면 분할 시점에 넣는 게 정확
-                }))
-
+                m = _parse_label_to_meta(lbl)
+                m.update({
+                    "law": law_name,                # 필터에 쓸 법령명
+                    "source": f"{base}::{lbl}",     # 표시용
+                })
+                metas.append(_sanitize_meta(m))
             total += len(chunks)
             print(f"  → {base}: 조/항 기준 {len(chunks)}개")
 
@@ -423,8 +414,9 @@ class RAGIndexer:
         print(f"  → dim={dim}")
 
         # --- CHROMA: 영구 클라이언트/컬렉션 생성 ---
-        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        client = PersistentClient(path=str(CHROMA_DIR))
+         = Path(index_dir)                      # ★ 변경 포인트
+        .mkdir(parents=True, exist_ok=True)
+        client = PersistentClient(path=str(chroma_dir))
 
         # 중복 빌드를 피하려면 기존 컬렉션 삭제 후 재생성(선택)
         try:
@@ -435,19 +427,12 @@ class RAGIndexer:
 
         collection = client.create_collection(
             name=CHROMA_COLLECTION,
-            metadata={
-                "hnsw:space": "cosine",   # E5는 L2 정규화 → cosine 추천
-                "model_name": self.model_name,
-            },
+            metadata={"hnsw:space": "cosine", "model_name": self.model_name,},
         )
 
-        # --- CHROMA: upsert ---
         print("📦 ChromaDB 업서트(add) 중...")
-        # ids는 고유 문자열 필요
         ids = [f"doc-{i}" for i in range(len(all_chunks))]
-        # ★ 교체: 위에서 만든 metas 사용 (길이 검증)
         assert len(metas) == len(all_chunks), f"metas({len(metas)}) != chunks({len(all_chunks)})"
-        # chroma는 list-of-list/pythonic 타입 권장
         collection.add(
             ids=ids,
             documents=list(all_chunks),
@@ -455,7 +440,7 @@ class RAGIndexer:
             metadatas=metas,
         )
 
-        print(f"✅ 저장 완료: Chroma @ {CHROMA_DIR}, collection='{CHROMA_COLLECTION}' | 총 청크 {total}개")
+        print(f"✅ 저장 완료 | 총 청크 {total}개") 
 
 
 # === 상단 공용 ===
@@ -482,6 +467,13 @@ def _extract_explicit_law_and_article(q: str):
     # article_key(문자열)는 보조용으로 필요 시 구성
     article_key = str(a_num) + (f"-{a_bis}" if (a_num and a_bis) else "") if a_num else None
     return law, a_num, a_bis, clause, article_key
+
+def _where_all(**kv):
+    terms = [{k: v} for k, v in kv.items() if v is not None]
+    if not terms:
+        return None
+    return {"$and": terms}
+    
 
 class RAGRetriever:
     def __init__(self, index_dir=INDEX_DIR, device=None):
@@ -528,16 +520,6 @@ class RAGRetriever:
             self._n_index = n
             self._n_meta = n
 
-
-    def _where_all(self, **kv):
-        terms = [{k: v} for k, v in kv.items() if v is not None]
-        if not terms:
-            return None
-        if len(terms) == 1:
-            return terms[0]              # ✅ 단일 조건은 그대로 반환 (예: {"law": "..."} )
-        return {"$and": terms}           # ✅ 2개 이상일 때만 $and
-
-    
     def _to_hits(self, res):
         """
         Chroma query/get 응답을 (idx, similarity) 리스트로 변환
@@ -547,11 +529,11 @@ class RAGRetriever:
         # 빈 결과 방어
         if not res or "ids" not in res or not res["ids"] or not res["ids"][0]:
             return []
-    
+        
         ids = res["ids"][0]
         # distances가 없을 수도 있으니 0.0으로 폴백
         dists = res.get("distances", [[0.0] * len(ids)])[0]
-    
+        
         out = []
         for id_, dist in zip(ids, dists):
             idx = self._id2idx.get(id_)
@@ -561,38 +543,13 @@ class RAGRetriever:
             out.append((idx, sim))
         return out
 
-    # RAGRetriever 내부 메서드로 추가
-    def _format_for_rerank(self, i: int) -> str:
-        """리랭커에 넣을 passage 앞에 [법][조][제목] 헤더를 붙인다."""
-        # 메타 안전 접근
-        meta = {}
-        try:
-            if hasattr(self, "metadatas") and self.metadatas:
-                meta = self.metadatas[i] or {}
-        except Exception:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-    
-        law   = (meta.get("law") or "").strip()
-        albl  = (meta.get("article_label") or meta.get("article") or "").strip()
-        atitle= (meta.get("article_title") or meta.get("title") or "").strip()
-    
-        head = " ".join(p for p in [
-            f"[법:{law}]"     if law   else "",
-            f"[조:{albl}]"    if albl  else "",
-            f"[제목:{atitle}]"if atitle else "",
-        ] if p)
-    
-        body = self.chunks[i]
-        return (head + "\n" if head else "") + body
 
     def search_mix_and_rerank(
         self,
         query: str,
         top_k: int = TOP_K,
-        M_generic: int = 1,     # 전역 검색 후보 수
-        M_filtered: int = 1,    # 필터 검색 후보 수 (질의에 법+조문 있을 때만)
+        M_generic: int = M_GENERIC,     # 전역 검색 후보 수
+        M_filtered: int = M_FILTERED,    # 필터 검색 후보 수 (질의에 법+조문 있을 때만)
         reranker: Optional["STReranker"] = None,
         use_clause: bool = True, # '항'까지 있으면 더 좁히기
     ) -> list[tuple[int, float]]:
@@ -620,15 +577,15 @@ class RAGRetriever:
         law, a_num, a_bis, clause, _article_key = _extract_explicit_law_and_article(query)
         hits_filtered = []
         if law and (a_num is not None):
-            # (기존 그대로) 조/조의 [+ 항] 필터
-            where = self._where_all(law=law, article_num=a_num, article_bis=a_bis)
+            where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
             if use_clause and (clause is not None):
-                where_clause = self._where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
+                where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
                 res_f1 = self.collection.query(
                     query_embeddings=q_emb, n_results=min(M_filtered, self._n_index),
                     where=where_clause, include=["distances"]
                 )
                 hits_filtered = self._to_hits(res_f1)
+                # 항으로 너무 좁아서 부족하면 조문 수준으로 보충
                 if len(hits_filtered) < min(M_filtered, self._n_index):
                     res_f2 = self.collection.query(
                         query_embeddings=q_emb, n_results=min(M_filtered, self._n_index),
@@ -641,18 +598,6 @@ class RAGRetriever:
                     where=where, include=["distances"]
                 )
                 hits_filtered = self._to_hits(res_f)
-        
-        elif law:
-            # ✅ 추가: 법령명만 명시된 경우에도 해당 법령으로 1차 좁히기
-            where_law = self._where_all(law=law)
-            res_law = self.collection.query(
-                query_embeddings=q_emb,
-                n_results=min(M_filtered, self._n_index),
-                where=where_law,
-                include=["distances"],
-            )
-            hits_filtered = self._to_hits(res_law)
-
     
         # --- 3) 후보 합치기(중복 제거)
         # idx 기준 dedup, 우선순위는 filtered > global (동일 idx면 한 번만)
@@ -668,18 +613,15 @@ class RAGRetriever:
     
         # --- 4) Rerank (없으면 combined 유사도 점수 그대로 정렬)
         if reranker is None:
+            # 기존 유사도(sim) 기준 내림차순 후 Top-K
             combined.sort(key=lambda x: x[1], reverse=True)
             return combined[:k]
-        
-        # ✅ 헤더 주입한 passage로 리랭크
-        aug_passages = [self._format_for_rerank(i) for i, _ in combined]
-        scores = reranker.score(query, aug_passages, batch_size=32)
-        
-        reranked = sorted(
-            zip([i for i, _ in combined], scores),
-            key=lambda x: x[1],
-            reverse=True
-        )
+    
+        passages = [self.chunks[i] for i, _ in combined]
+        scores = reranker.score(query, passages, batch_size=32)
+        # reranker 점수로 재정렬
+        reranked = sorted(zip([i for i, _ in combined], scores), key=lambda x: x[1], reverse=True)
+        # Top-K 반환: (idx, rerank_score)
         return reranked[:k]
     
     # === RAGRetriever 내부 ===
@@ -693,10 +635,10 @@ class RAGRetriever:
         
         # 1) 명시적 법 + '조'(및 '조의')가 있으면 '숫자'로 필터
         if law and a_num is not None:
-            where = self._where_all(law=law, article_num=a_num, article_bis=a_bis)
+            where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
             # (선택) 항까지 있으면 더 좁히기 시도
             if clause is not None:
-                where_clause = self._where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
+                where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
                 res = self.collection.query(query_embeddings=q_emb, n_results=k, where=where_clause, include=["distances"])
                 hits = self._to_hits(res)
                 if hits:   # 최소 1건 나오면 여기서 반환
@@ -713,15 +655,7 @@ class RAGRetriever:
             hits = self._to_hits(res)
             if hits:
                 return hits
-
-        # ✅ 추가: 법령명만 있을 때는 법령 필터로 한 번 좁혀본다
-        if law:
-            where_law = self._where_all(law=law)
-            res_law = self.collection.query(query_embeddings=q_emb, n_results=k, where=where_law, include=["distances"])
-            hits = self._to_hits(res_law)
-            if hits:
-                return hits
-                
+        
         # 2) 필터 결과가 0이면 전역 검색 폴백 (원래대로)
         res = self.collection.query(query_embeddings=q_emb, n_results=k, include=["distances"])
         return self._to_hits(res)
@@ -733,7 +667,6 @@ class RAGRetriever:
 
     def get_sources(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.sources[i] for i, _ in hits]
-
 
 
 # -----------------------------
@@ -748,9 +681,9 @@ def answer_with_rag(
     top_k=TOP_K,
     score_threshold: float = SCORE_THRESHOLD,   # 임베딩 검색용 임계값(폴백)
     reranker: Optional["STReranker"] = None,       # ★ 추가: CrossEncoder reranker
-    rerank_threshold: float = 0.0,              # ★ 추가: reranker 점수 임계값
-    M_generic: int = 1,                        # ★ 추가: 전역 후보 수
-    M_filtered: int = 1,                       # ★ 추가: 법/조문 필터 후보 수
+    rerank_threshold: float = RERANK_THRESHOLD,              # ★ 추가: reranker 점수 임계값
+    M_generic: int = M_GENERIC,                        # ★ 추가: 전역 후보 수
+    M_filtered: int = M_FILTERED,                       # ★ 추가: 법/조문 필터 후보 수
 ):
     
     is_mc, _ = is_multiple_choice(question)
@@ -769,7 +702,7 @@ def answer_with_rag(
         use_context = (len(hits) > 0) and (top_score >= rerank_threshold)
     else:
         # 기존 전역 검색
-        hits = retriever.search(question, top_k=2)
+        hits = retriever.search(question, top_k=top_k)
         passages = retriever.get_passages(hits)
         top_score = hits[0][1] if hits else 0.0            # 임베딩 유사도
         use_context = (top_score >= score_threshold)
@@ -824,6 +757,7 @@ def answer_with_rag(
 def cmd_build(args):
     _ensure_dir(INDEX_DIR)
     indexer = RAGIndexer(MODEL_NAME, device="cpu")
+
     pdfs = []
     if args.pdf:
         pdfs.extend(args.pdf)
@@ -833,7 +767,15 @@ def cmd_build(args):
                 pdfs.append(os.path.join(args.dir, name))
     if not pdfs:
         raise ValueError("PDF가 없습니다. --pdf 다중 또는 --dir를 지정하세요.")
-    indexer.build_many(pdfs, INDEX_DIR)
+
+    # ★ 추가: --dir의 마지막 폴더명을 네임스페이스로 사용해 INDEX_DIR/<ns>에 저장
+    if args.dir:
+        ns = os.path.basename(os.path.normpath(args.dir))  # "laws/"
+    else:
+        ns = "default"
+    out_dir = os.path.join(INDEX_DIR, ns)
+
+    indexer.build_many(pdfs, index_dir=out_dir)   # ← 여기!
 
 
 
@@ -851,9 +793,9 @@ def cmd_ask(args):
     # 하이퍼파라미터
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)      # 임베딩 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", 0.0)          # reranker 컨텍스트 게이트
-    M_generic = getattr(args, "M_generic", 1)
-    M_filtered = getattr(args, "M_filtered", 1)
+    rerank_threshold = getattr(args, "rerank_threshold", RERANK_THRESHOLD)          # reranker 컨텍스트 게이트
+    M_generic = getattr(args, "M_generic", M_GENERIC)
+    M_filtered = getattr(args, "M_filtered", M_FILTERED)
 
     q = args.question
 
@@ -919,9 +861,9 @@ def cmd_run(args):
     # 하이퍼파라미터(없으면 기본값 사용)
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)          # embed 검색 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", 0.0)              # reranker 점수 임계값
-    M_generic = getattr(args, "M_generic", 1)                              # 전역 후보 수
-    M_filtered = getattr(args, "M_filtered", 1)                            # 필터 후보 수
+    rerank_threshold = getattr(args, "rerank_threshold", RERANK_THRESHOLD)              # reranker 점수 임계값
+    M_generic = getattr(args, "M_generic", M_GENERIC)                              # 전역 후보 수
+    M_filtered = getattr(args, "M_filtered", M_FILTERED)                            # 필터 후보 수
 
     from tqdm import tqdm
     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
