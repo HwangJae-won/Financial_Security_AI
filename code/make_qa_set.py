@@ -2,11 +2,13 @@ import os
 import pdfplumber
 import pandas as pd
 from typing import List, Dict
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import torch
-os.environ['HUGGINGFACE_HUB_CACHE'] = '/dev/shm/huggingface_cache'
-from config import CACHE_DIR
+import gc
+import torch
 
+gc.collect()
+torch.cuda.empty_cache()
 # 사용자 제공 함수s
 def load_pdf_text(pdf_path: str) -> str:
     """
@@ -32,10 +34,11 @@ def generate_test_set_with_hf_model(text: str, model_name: str, target_count: in
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"모델 실행 장치: {device}")
     
+    if device == "cpu":
+        print("경고: GPU가 없어 CPU로 실행됩니다. 매우 느릴 수 있습니다.")
+    
     try:
         print(f"'{model_name}' 모델 로딩 중...")
-        # 8비트 양자화 설정을 위해 BitsAndBytesConfig 사용
-        # quantization_config = BitsAndBytesConfig(load_in_8bit=True)
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.float16,
@@ -43,30 +46,27 @@ def generate_test_set_with_hf_model(text: str, model_name: str, target_count: in
             bnb_4bit_use_double_quant=True,
         )
         
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             quantization_config=quantization_config,
-            cache_dir=CACHE_DIR,
+            cache_dir='/dev/shm/huggingface_cache', # 캐시 경로 직접 지정
             torch_dtype=torch.float16,
-            device_map='auto'
+            device_map='auto', 
+            trust_remote_code=True
         )
-   
         print("모델 로딩 완료.")
     except Exception as e:
         print(f"모델 로딩 중 오류 발생: {e}")
         return []
 
-    # 프롬프트 구성: 객관식과 주관식을 모두 생성하도록 명시
     instruction = (
         f"다음 금융 보안 관련 문서를 기반으로 객관식 및 주관식 문제를 {target_count}개 생성해줘. "
         "문제와 정답은 '문제: ... 정답: ...' 형식으로 명확하게 구분해줘."
         "객관식 문제의 경우, 정답은 '정답: (번호)' 형식으로 표시하고, 주관식 문제의 경우, '정답: (상세 답변)' 형식으로 표시해줘."
     )
     
-    # 모델 입력 토큰 제한을 고려하여 텍스트를 분할
     max_length = model.config.max_position_embeddings if hasattr(model.config, 'max_position_embeddings') else 2048
-    # 답변 길이를 고려하여 여유 공간 확보 (512 토큰)
     chunk_size = max_length - len(tokenizer.encode(instruction)) - 512
     
     chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
@@ -79,47 +79,53 @@ def generate_test_set_with_hf_model(text: str, model_name: str, target_count: in
         print(f"\n--- 텍스트 청크 {i+1}/{len(chunks)} 처리 시작 ---")
         
         chunk_prompt = f"### Instruction:\n{instruction}\n\n### Context:\n{chunk}\n\n### Response:"
-        input_ids = tokenizer.encode(chunk_prompt, return_tensors="pt").to(device)
-
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_length=len(input_ids[0]) + 512,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                repetition_penalty=1.2,
-                pad_token_id=tokenizer.eos_token_id
-            )
-
-        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        print(f"\n모델이 생성한 원본 텍스트:\n{generated_text}\n")
         
-        # 모델이 생성한 텍스트에서 질문-답변 쌍 파싱
+        inputs = tokenizer(chunk_prompt, return_tensors="pt").to(device)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+
         try:
-            generated_qa_str = generated_text.split("### Response:")[1].strip()
-            lines = generated_qa_str.split('\n')
+            with torch.no_grad():
+                output_ids = model.generate(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    max_length=len(input_ids[0]) + 512,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    repetition_penalty=1.2,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            print(f"\n모델이 생성한 원본 텍스트:\n{generated_text}\n")
             
-            # 파싱 로직 개선
-            current_question = ""
-            current_answer = ""
-            for line in lines:
-                if line.startswith("문제:"):
-                    if current_question and current_answer:
-                        qa_pairs.append({"Question": current_question.strip(), "Answer": current_answer.strip()})
-                    current_question = line.replace("문제:", "", 1).strip()
-                    current_answer = ""
-                elif line.startswith("정답:"):
-                    current_answer += line.replace("정답:", "", 1).strip()
-                elif current_question:
-                    current_answer += " " + line.strip()
-            
-            if current_question and current_answer:
-                qa_pairs.append({"Question": current_question.strip(), "Answer": current_answer.strip()})
-        except IndexError:
-            print("경고: 모델 출력 형식이 '### Response:'를 포함하지 않아 파싱을 건너뜁니다.")
+            try:
+                generated_qa_str = generated_text.split("### Response:")[1].strip()
+                lines = generated_qa_str.split('\n')
+                
+                current_question = ""
+                current_answer = ""
+                for line in lines:
+                    if line.startswith("문제:"):
+                        if current_question and current_answer:
+                            qa_pairs.append({"Question": current_question.strip(), "Answer": current_answer.strip()})
+                        current_question = line.replace("문제:", "", 1).strip()
+                        current_answer = ""
+                    elif line.startswith("정답:"):
+                        current_answer += line.replace("정답:", "", 1).strip()
+                    elif current_question:
+                        current_answer += " " + line.strip()
+                
+                if current_question and current_answer:
+                    qa_pairs.append({"Question": current_question.strip(), "Answer": current_answer.strip()})
+            except IndexError:
+                print("경고: 모델 출력 형식이 '### Response:'를 포함하지 않아 파싱을 건너뜁니다.")
+                continue
+        except Exception as e:
+            print(f"모델 생성 중 오류 발생: {e}")
             continue
-            
+
     print(f"\n\n--- 최종 결과 ---")
     print(f"총 {len(qa_pairs)}개의 질문-답변 쌍 생성 완료.")
     return qa_pairs
@@ -136,7 +142,7 @@ def save_qa_to_csv(qa_data: List[Dict[str, str]], output_filename: str):
 
 if __name__ == "__main__":
     pdf_folder = "./laws"
-    model_id = "LGAI-EXAONE/EXAONE-Deep-7.8B"
+    model_id = "yanolja/EEVE-Korean-Instruct-2.8B-v1.0"
     target_qa_count = 200
     
     full_corpus = ""

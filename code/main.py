@@ -19,7 +19,7 @@ def main_rerank():
     print("--- Financial Security AI Rerank Model Started---")
     
     # Reranker 모델 로드 (model.py에 구현)
-    print("✨ Reranker 모델 로딩 중: sbert.net/ms-marco-TinyBERT-L-2-v2")
+    print("✨ Reranker 모델 로딩 중")
     reranker_model = load_reranker_model()
 
     # 기존 RAG 파이프라인
