@@ -31,7 +31,6 @@ import math
 import pdfplumber
 from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
 import torch
-import faiss
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # 기존 프로젝트 모듈
@@ -40,6 +39,9 @@ from utils import is_multiple_choice, extract_question_and_choices, extract_answ
 from prompt import make_prompt_rag_exaone 
   
 
+from pathlib import Path
+import chromadb
+from chromadb import PersistentClient
 
 
 # -----------------------------
@@ -60,9 +62,6 @@ os.environ["ANONYMIZED_TELEMETRY"] = "false"      # 크로마 텔레메트리 �
 os.environ["CHROMADB_TELEMETRY_ENABLED"] = "false"
 
 # --- CHROMA: imports & constants ---
-from pathlib import Path
-import chromadb
-from chromadb import PersistentClient
 
 # Chroma 영구 저장 경로와 컬렉션 이름
 CHROMA_COLLECTION = "rag_index"  
@@ -93,10 +92,9 @@ class E5Embedder:
             texts,
             batch_size=batch_size,
             convert_to_numpy=True,
-            normalize_embeddings=True,   # FAISS IP(코사인)와 일치
+            normalize_embeddings=True, 
             show_progress_bar=(show_progress if show_progress is not None else (len(texts) > batch_size))
         )
-        # float32로 고정(FAISS/메모리 일관성)
         return embs.astype(np.float32, copy=False)
 
     def encode_passages(self, passages):
@@ -192,10 +190,11 @@ ARTICLE_RE_FALLBACK = re.compile(
     re.UNICODE
 )
 
-# 항/호 마커 (다양한 표기 대응: ①②… / '1항' / '1.' 등)
+# 항/호 마커 (다양한 표기 대응: ①②… / '1.' 등)
 PARA_SPLIT_RE = re.compile(
-    r'(?m)^(?=(?:[①-⑳]|[0-9]+\.?\s*항|[0-9]+\)))'
+    r'(?m)^(?=(?:[①-⑳]))'
 )
+
 
 def parse_korean_law_articles(raw_text: str):
     text = _clean_text(raw_text)
@@ -414,8 +413,8 @@ class RAGIndexer:
         print(f"  → dim={dim}")
 
         # --- CHROMA: 영구 클라이언트/컬렉션 생성 ---
-         = Path(index_dir)                      # ★ 변경 포인트
-        .mkdir(parents=True, exist_ok=True)
+        chroma_dir = Path(index_dir)                      # ★ 변경 포인트
+        chroma_dir.mkdir(parents=True, exist_ok=True)
         client = PersistentClient(path=str(chroma_dir))
 
         # 중복 빌드를 피하려면 기존 컬렉션 삭제 후 재생성(선택)
@@ -476,17 +475,30 @@ def _where_all(**kv):
     
 
 class RAGRetriever:
-    def __init__(self, index_dir=INDEX_DIR, device=None):
-        # --- CHROMA: 로드 ---
-        if not (CHROMA_DIR.exists()):
-            raise FileNotFoundError("Chroma 인덱스가 없습니다. 먼저 `python rag.py build --pdf <path>`를 실행하세요.")
-        client = PersistentClient(path=str(CHROMA_DIR))
-        try:
-            self.collection = client.get_collection(CHROMA_COLLECTION)
-        except Exception as e:
-            raise FileNotFoundError(f"Chroma 컬렉션 '{CHROMA_COLLECTION}'을 찾을 수 없습니다.") from e
+    def __init__(self, index_dir=INDEX_DIR, device=None, collection_name=CHROMA_COLLECTION):
+        # --- CHROMA: 로드 (빌드 시 사용한 경로 그대로) ---
+        chroma_dir = Path(index_dir)
 
-        # 메모리 캐시(FAISS 호환 인터페이스 유지를 위해)
+        # (옵션) 사용자가 "laws" 같은 네임스페이스만 준 경우를 위한 폴백
+        if not chroma_dir.exists() and not chroma_dir.is_absolute():
+            maybe = Path(INDEX_DIR) / index_dir
+            if maybe.exists():
+                chroma_dir = maybe
+
+        if not chroma_dir.exists():
+            raise FileNotFoundError(
+                f"Chroma 인덱스가 없습니다: {chroma_dir}\n"
+                "먼저 `python rag.py build --dir <폴더>` 또는 `--pdf <파일...>`로 빌드하세요."
+            )
+
+        client = PersistentClient(path=str(chroma_dir))
+        try:
+            self.collection = client.get_collection(collection_name)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Chroma 컬렉션 '{collection_name}'을(를) {chroma_dir}에서 찾을 수 없습니다."
+            ) from e
+
         got = self.collection.get(include=["documents", "metadatas"])
         self.doc_ids: List[str] = got["ids"]
         self.chunks: List[str] = got["documents"]
@@ -783,7 +795,7 @@ def cmd_ask(args):
     import os
     import torch
     pipe = load_model()
-    retr = RAGRetriever(INDEX_DIR, device="cpu")
+    retr = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "laws"), device="cpu")
 
     # --- Reranker 준비 (없으면 CPU로도 동작) ---
     rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
@@ -841,7 +853,7 @@ def cmd_run(args):
 
     # 1) 모델/인덱스 로드
     pipe = load_model()
-    retr = RAGRetriever(INDEX_DIR, device="cpu")
+    retr = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "laws"), device="cpu")
 
     # 2) Reranker 준비 (없으면 CPU로도 동작)
     rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
