@@ -7,6 +7,8 @@
 
     # 2) 단일 질문
     !python code/rag.py ask --question "전자자금이체의 지급 효력 발생 시점을 전자금융거래법 기준에 따라 설명하세요."
+    !python code/rag.py ask --question "금융회사가 정보보호 예산을 관리할 때, 전자금융감독규정상 정보기술부문 인력 및 예산의 기준 비율은 얼마인가요?"
+    
     !python code/rag.py ask --question $'전자금융거래법 제44조에 따르면, 청문 절차가 필요한 경우는 무엇인가?\n1 전자금융거래의 중단\n2 전자금융거래의 보안 점검\n3 전자금융업자의 등록 취소\n4 전자금융거래의 수수료 변경'
     !python code/rag.py ask --question $'국내대리인이 법을 위반한 경우, 그 책임은 누구에게 있는가?\n1 국내대리인\n2 정부기관\n3 법원\n4 정보통신서비스 제공자\n5 개인정보 처리 위탁업체'
     !python code/rag.py ask --question $'개인정보보호법 제63조에 따르면, 보호위원회가 자료제출 요구 및 검사를 통해 수집한 서류나 자료를 제3자에게 제공하거나 일반에 공개할 수 있는 경우는?\n1 자료가 비밀이 아닌 경우\n2 개인정보처리자의 동의가 있는 경우\n3 정보주체가 개인정보 열람을 요청한 경우\n4 법에 따른 경우\n5 보호위원회의 내부 규정에 따른 경우'
@@ -44,6 +46,10 @@ import chromadb
 from chromadb import PersistentClient
 
 
+
+import hashlib
+from typing import List, Dict
+
 # -----------------------------
 # 설정
 # -----------------------------
@@ -53,7 +59,7 @@ CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
 TOP_K = 1             # 검색 상위 k개
 
-SCORE_THRESHOLD = 0.89
+SCORE_THRESHOLD = 0.5
 OUTPUT_PATH = "results/"
 
 
@@ -67,7 +73,7 @@ os.environ["CHROMADB_TELEMETRY_ENABLED"] = "false"
 CHROMA_COLLECTION = "rag_index"  
 
 RERANK_THRESHOLD = 0.0
-M_GENERIC = 1
+M_GENERIC = 2
 M_FILTERED = 1
 
 # ---- E5 임베딩 클래스 (sentence-transformers 버전) ----
@@ -555,6 +561,67 @@ class RAGRetriever:
             out.append((idx, sim))
         return out
 
+    def _hits_to_dicts(self, hits: List[tuple[int, float]], retriever_tag: str) -> List[Dict]:
+        out = []
+        for idx, sim in hits:
+            out.append({
+                "idx": idx,
+                "text": self.chunks[idx],
+                "sim": float(sim),
+                "source": self.sources[idx] if idx < len(self.sources) else "unknown",
+                "retriever": retriever_tag,   # "A" or "B" 등 외부 식별 태그
+            })
+        return out
+
+    def global_search(self, query: str, n: int, retriever_tag: str) -> List[Dict]:
+        if self._n_index <= 0:
+            return []
+        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
+        res = self.collection.query(
+            query_embeddings=q_emb,
+            n_results=min(int(n), self._n_index),
+            include=["distances"],
+        )
+        hits = self._to_hits(res)
+        return self._hits_to_dicts(hits, retriever_tag)
+
+    def filtered_search(self, query: str, n: int, retriever_tag: str, use_clause: bool = True) -> List[Dict]:
+        if self._n_index <= 0:
+            return []
+        law, a_num, a_bis, clause, _article_key = _extract_explicit_law_and_article(query)
+        if not (law and (a_num is not None)):
+            return []  # 명시적 법/조문 없으면 필터 검색 생략
+
+        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
+
+        where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
+        hits_filtered = []
+
+        if use_clause and (clause is not None):
+            where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
+            res_f1 = self.collection.query(
+                query_embeddings=q_emb, n_results=min(int(n), self._n_index),
+                where=where_clause, include=["distances"]
+            )
+            hits_filtered = self._to_hits(res_f1)
+            if len(hits_filtered) < min(int(n), self._n_index):
+                res_f2 = self.collection.query(
+                    query_embeddings=q_emb, n_results=min(int(n), self._n_index),
+                    where=where, include=["distances"]
+                )
+                add = self._to_hits(res_f2)
+                # idx 기준 dedup
+                seen = {i for i, _ in hits_filtered}
+                hits_filtered += [h for h in add if h[0] not in seen]
+        else:
+            res_f = self.collection.query(
+                query_embeddings=q_emb, n_results=min(int(n), self._n_index),
+                where=where, include=["distances"]
+            )
+            hits_filtered = self._to_hits(res_f)
+
+        return self._hits_to_dicts(hits_filtered, retriever_tag)
+        
 
     def search_mix_and_rerank(
         self,
@@ -686,46 +753,149 @@ class RAGRetriever:
 # -----------------------------
 
 
+def _rrf(rank: int, k: int = 60) -> float:
+    return 1.0 / (k + rank)
+
+def _key_pair(c: Dict) -> str:
+    # (retriever_tag, idx) 페어 기준으로 중복 제거 (가장 안전)
+    return f'{c["retriever"]}:{c["idx"]}'
+
+def fuse_rrf(candidate_lists: List[List[Dict]], keep_for_ce: int = 50) -> List[Dict]:
+    merged = {}
+    for cand in candidate_lists:
+        for rank, c in enumerate(cand, start=1):
+            k = _key_pair(c)
+            if k not in merged:
+                merged[k] = {**c, "rrf": _rrf(rank)}
+            else:
+                merged[k]["rrf"] += _rrf(rank)
+    return sorted(merged.values(), key=lambda x: x["rrf"], reverse=True)[:keep_for_ce]
+
+def fuse_rrf_global_only(candidate_lists: List[List[Dict]], keep_for_ce: int = 50) -> List[Dict]:
+    merged = {}
+    for cand in candidate_lists:
+        for rank, c in enumerate(cand, start=1):
+            k = _key_pair(c)
+            if k not in merged:
+                merged[k] = {**c, "rrf": _rrf(rank)}
+            else:
+                merged[k]["rrf"] += _rrf(rank)
+    return sorted(merged.values(), key=lambda x: x["rrf"], reverse=True)[:keep_for_ce]
+    
+def rerank_and_pick(query: str, candidates: List[Dict], reranker, topn: int = 1, batch_size: int = 32) -> List[Dict]:
+    if not candidates:
+        return []
+    passages = [c["text"] for c in candidates]
+    ce_scores = reranker.score(query, passages, batch_size=batch_size)
+    for c, s in zip(candidates, ce_scores):
+        c["ce_score"] = float(s)
+    return sorted(candidates, key=lambda x: x["ce_score"], reverse=True)[:topn]
+
+def search_two_indexes_pipeline(
+    query: str,
+    retrA, retrB,          # RAGRetriever
+    M_generic_A: int, M_filtered_A: int, M_generic_B: int,
+    reranker, keep_for_ce: int, topn: int, use_clause: bool = True
+) -> List[Dict]:
+    # A: 전역 + (있으면) 필터
+    cand_gA = retrA.global_search(query, n=M_generic_A, retriever_tag="A")
+    cand_fA = retrA.filtered_search(query, n=M_filtered_A, retriever_tag="A", use_clause=use_clause)
+    # B: 전역
+    cand_gB = retrB.global_search(query, n=M_generic_B, retriever_tag="B")
+
+    # 융합 → rerank
+    candidates = fuse_rrf([cand_fA, cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+    final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
+    return final            # Dict 리스트 (각 원소에 text/source/retriever/idx/ce_score 포함)
+
+def search_two_indexes_global_only(
+    query: str,
+    retrA, retrB,                 # RAGRetriever
+    M_generic_A: int = 20,
+    M_generic_B: int = 20,
+    reranker=None,
+    keep_for_ce: int = 50,
+    topn: int = 3,
+) -> List[Dict]:
+    # 1) 전역 검색만 실행 (A/B)
+    cand_gA = retrA.global_search(query, n=M_generic_A, retriever_tag="A")
+    cand_gB = retrB.global_search(query, n=M_generic_B, retriever_tag="B")
+
+    # 2) 융합(RRF) → 3) CE rerank
+    candidates = fuse_rrf_global_only([cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+    final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
+    return final  # [{"idx","text","source","retriever","ce_score",...}, ...]
+    
 def answer_with_rag(
     question: str,
-    retriever: RAGRetriever,
+    retrieverA: RAGRetriever,                # ★ 바뀜: A 인덱스
+    retrieverB: RAGRetriever,                # ★ 바뀜: B 인덱스
     pipe,
     top_k=TOP_K,
-    score_threshold: float = SCORE_THRESHOLD,   # 임베딩 검색용 임계값(폴백)
-    reranker: Optional["STReranker"] = None,       # ★ 추가: CrossEncoder reranker
-    rerank_threshold: float = RERANK_THRESHOLD,              # ★ 추가: reranker 점수 임계값
-    M_generic: int = M_GENERIC,                        # ★ 추가: 전역 후보 수
-    M_filtered: int = M_FILTERED,                       # ★ 추가: 법/조문 필터 후보 수
+    score_threshold: float = SCORE_THRESHOLD,
+    reranker: Optional["STReranker"] = None,
+    rerank_threshold: float = RERANK_THRESHOLD,
+    M_generic: int = M_GENERIC,              # A의 전역 후보 (기존 의미 유지)
+    M_filtered: int = M_FILTERED,            # A의 필터 후보
+    M_generic_B: int = None,                 # ★ 추가: B 전역 후보 (기본 없으면 M_generic과 동일)
+    keep_for_ce: int = 50,                   # ★ 추가: CE에 태울 최대 후보 수
+    use_clause: bool = True,                 # ★ 추가: 항 단위까지 필터
 ):
-    
+    if M_generic_B is None:
+        M_generic_B = M_generic
+
     is_mc, _ = is_multiple_choice(question)
+
     # --- 1) 검색 ---
     if reranker is not None and is_mc:
-        # 혼합 검색(전역 + 명시적 법/조문 필터) → rerank
-        hits = retriever.search_mix_and_rerank(
-            question,
-            top_k=top_k,
-            M_generic=M_generic,
-            M_filtered=M_filtered,
-            reranker=reranker,
+        # A(전역+필터) + B(전역) → RRF → CE rerank
+        final = search_two_indexes_pipeline(
+            query=question,
+            retrA=retrieverA, retrB=retrieverB,
+            M_generic_A=M_generic, M_filtered_A=M_filtered, M_generic_B=M_generic_B,
+            reranker=reranker, keep_for_ce=keep_for_ce, topn=max(1, top_k),
+            use_clause=use_clause,
         )
-        passages = retriever.get_passages(hits)
-        top_score = hits[0][1] if hits else float("-inf")  # reranker 점수
-        use_context = (len(hits) > 0) and (top_score >= rerank_threshold)
-    else:
-        # 기존 전역 검색
-        hits = retriever.search(question, top_k=top_k)
-        passages = retriever.get_passages(hits)
-        top_score = hits[0][1] if hits else 0.0            # 임베딩 유사도
-        use_context = (top_score >= score_threshold)
+        passages = [c["text"] for c in final[:top_k]]
+        top_score = final[0]["ce_score"] if final else float("-inf")
+        use_context = (len(final) > 0) and (top_score >= rerank_threshold)
 
-    contexts = passages if use_context else []
+        # 디버깅/호환용: hits는 (pseudo) 튜플로 만들어 두되, 인덱스 구분을 위해 문자열 키 사용
+        hits = [(f'{c["retriever"]}:{c["idx"]}', c["ce_score"]) for c in final[:top_k]]
+
+        # 멀티 인덱스이므로 contexts는 passages 자체를 씀
+        contexts = passages if use_context else []
+        top_meta_for_debug = [{"retriever": c["retriever"], "source": c.get("source","unknown"), "score": c["ce_score"]} for c in final[:top_k]]
+
+    else:
+        # --- 주관식 처리: 두 인덱스 전역 검색만 수행 후 rerank ---
+        final = search_two_indexes_global_only(
+            query=question,
+            retrA=retrieverA,
+            retrB=retrieverB,
+            M_generic_A=M_generic,     # laws 인덱스 전역 후보 수
+            M_generic_B=M_generic_B,   # supplement 인덱스 전역 후보 수
+            reranker=reranker,
+            keep_for_ce=keep_for_ce,
+            topn=max(1, top_k),
+        )
+
+        passages = [c["text"] for c in final[:top_k]]
+        top_score = final[0]["ce_score"] if final else float("-inf")
+        use_context = (len(final) > 0) and (top_score >= score_threshold)  # 게이트는 score_threshold 재사용
+
+        # hits와 meta_dbg 준비
+        hits = [(f'{c["retriever"]}:{c["idx"]}', c["ce_score"]) for c in final[:top_k]]
+        contexts = passages if use_context else []
+        top_meta_for_debug = [
+            {"retriever": c["retriever"], "source": c.get("source", "unknown"), "score": c["ce_score"]}
+            for c in final[:top_k]
+        ]
 
     # --- 2) 프롬프트 ---
     prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
 
-    # --- 3) 1차 생성 (greedy) ---
-    
+    # --- 3) 1차 생성 ---
     try:
         if is_mc:
             out = pipe(prompt, max_new_tokens=2, do_sample=False)
@@ -751,15 +921,15 @@ def answer_with_rag(
                 gen = o["generated_text"]
                 break
 
-    # --- 5) 객관식 후처리: 숫자 강제 ---
+    # --- 5) 객관식 후처리 ---
     if is_mc:
         m = re.search(r"\b([1-9][0-9]?)\b", gen)
         if not m:
             out = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
 
-    return prompt, gen, passages, hits, use_context, contexts
-
+    # 멀티 인덱스 디버깅 정보를 되돌려 주면 cmd_run에서 소스 로깅이 쉬워짐
+    return prompt, gen, passages, hits, use_context, contexts, top_meta_for_debug
 
 
 
@@ -792,38 +962,49 @@ def cmd_build(args):
 
 
 def cmd_ask(args):
-    import os
-    import torch
+    
     pipe = load_model()
-    retr = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "laws"), device="cpu")
 
-    # --- Reranker 준비 (없으면 CPU로도 동작) ---
+    # 1) 두 인덱스 로드
+    retrA = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "laws"), device="cpu")
+    retrB = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "supplement"), device="cpu")
+
+    # 2) Reranker 준비
     rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
     reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=512)
 
-    # 하이퍼파라미터
+    # 3) 하이퍼파라미터
     top_k = getattr(args, "top_k", TOP_K)
-    score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)      # 임베딩 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", RERANK_THRESHOLD)          # reranker 컨텍스트 게이트
-    M_generic = getattr(args, "M_generic", M_GENERIC)
-    M_filtered = getattr(args, "M_filtered", M_FILTERED)
+    score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)          # (폴백 경로용)
+    rerank_threshold = getattr(args, "rerank_threshold", RERANK_THRESHOLD) # CE 컨텍스트 게이트
+    M_generic_A = getattr(args, "M_generic", M_GENERIC)                    # laws 전역 후보
+    M_filtered_A = getattr(args, "M_filtered", M_FILTERED)                 # laws 필터 후보
+    M_generic_B = getattr(args, "M_generic_B", M_generic_A)                # supplement 전역 후보
+    keep_for_ce = getattr(args, "keep_for_ce", 50)
+    use_clause = getattr(args, "use_clause", True)
 
     q = args.question
 
-    # --- 혼합 검색 + rerank 사용 ---
-    prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
+    # 4) 혼합 검색(A 전역+필터, B 전역) → RRF → CE rerank
+    #    멀티 인덱스 answer_with_rag은 meta_dbg를 추가로 반환
+    prompt, gen, passages, hits, use_context, contexts, meta_dbg = answer_with_rag(
         q,
-        retr,
-        pipe,
+        retrieverA=retrA,
+        retrieverB=retrB,
+        pipe=pipe,
         top_k=top_k,
-        score_threshold=score_threshold,
-        reranker=reranker,                 # ★ 중요: reranker 주입
-        rerank_threshold=rerank_threshold, # ★ 중요: rerank 임계값
-        M_generic=M_generic,
-        M_filtered=M_filtered,
+        score_threshold=score_threshold,           # (단일 폴백 경로에서만 사용)
+        reranker=reranker,
+        rerank_threshold=rerank_threshold,
+        M_generic=M_generic_A,
+        M_filtered=M_filtered_A,
+        M_generic_B=M_generic_B,
+        keep_for_ce=keep_for_ce,
+        use_clause=use_clause,
     )
 
+    # 5) 출력
     print("\n===== 생성된 답변 =====")
     print(gen)
     ans = extract_answer_only(gen, original_question=q, prompt=prompt)
@@ -832,17 +1013,30 @@ def cmd_ask(args):
 
     print("\n===== 검색 결과 요약 =====")
     if hits:
-        # reranker 점수(상위1) 기준으로 표시
-        print(f"Top-1 rerank_score={hits[0][1]:.3f} | rerank_threshold={rerank_threshold:.2f} | context_used={use_context}")
+        # 멀티 인덱스 경로: hits는 ("A:idx", ce_score) 형태
+        print(f"Top-1 ce_score={hits[0][1]:.3f} | rerank_threshold={rerank_threshold:.2f} | context_used={use_context}")
     else:
         print("검색 결과 없음 | context_used=False")
 
+    # 6) 참고 컨텍스트/소스 출력
     if use_context:
-        srcs = retr.get_sources(hits)
         print("\n===== 참고된 청크 (점수순) =====")
-        for (idx, score), p, s in zip(hits, passages, srcs):
-            print(f"\n[rerank_score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
-
+        if meta_dbg is not None:
+            # 멀티 인덱스 경로: meta_dbg에 retriever(A/B), source, score 포함
+            for i, (md, p) in enumerate(zip(meta_dbg[:3], passages[:top_k]), start=1):
+                tag = md.get("retriever", "?")
+                src = md.get("source", "unknown")
+                sc  = md.get("score", float("nan"))
+                print(f"\n[{i}] [ce_score={sc:.3f}] retriever={tag} | source={src}\n{p[:400]}...")
+        else:
+            # 단일 인덱스 폴백 경로 (남겨둠)
+            try:
+                srcs = retrA.get_sources(hits)
+                for (idx, score), p, s in zip(hits, passages, srcs):
+                    print(f"\n[ce_score={score:.3f}] chunk#{idx} | source={s}\n{p[:400]}...")
+            except Exception:
+                for (idx, score), p in zip(hits, passages):
+                    print(f"\n[score={score:.3f}] chunk#{idx}\n{p[:400]}...")
 
 
 def cmd_run(args):
@@ -853,9 +1047,10 @@ def cmd_run(args):
 
     # 1) 모델/인덱스 로드
     pipe = load_model()
-    retr = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "laws"), device="cpu")
+    retrA = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "laws"), device="cpu")
+    retrB = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "supplement"), device="cpu")
 
-    # 2) Reranker 준비 (없으면 CPU로도 동작)
+    # 2) Reranker
     rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
     reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=800)
@@ -863,33 +1058,35 @@ def cmd_run(args):
     # 3) CSV 로드
     df = pd.read_csv(args.csv)
 
-    preds = []
-    context_flags = []         # context 사용 여부 (True/False)
-    full_context = []          # context 원문
-    generated_texts = []       # 출력값
-    top_sources = []           # (디버깅) 선택된 패시지 소스
-    top_scores  = []           # (디버깅) reranker 또는 embed 스코어
+    preds, context_flags, full_context = [], [], []
+    generated_texts, top_sources, top_scores = [], [], []
 
-    # 하이퍼파라미터(없으면 기본값 사용)
     top_k = getattr(args, "top_k", TOP_K)
-    score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)          # embed 검색 폴백용
-    rerank_threshold = getattr(args, "rerank_threshold", RERANK_THRESHOLD)              # reranker 점수 임계값
-    M_generic = getattr(args, "M_generic", M_GENERIC)                              # 전역 후보 수
-    M_filtered = getattr(args, "M_filtered", M_FILTERED)                            # 필터 후보 수
+    score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)
+    rerank_threshold = getattr(args, "rerank_threshold", RERANK_THRESHOLD)
+    M_generic = getattr(args, "M_generic", M_GENERIC)
+    M_filtered = getattr(args, "M_filtered", M_FILTERED)
+    M_generic_B = getattr(args, "M_generic_B", M_GENERIC)   # ★ supplement 기본 후보 수
+    keep_for_ce = getattr(args, "keep_for_ce", 50)
+    use_clause = getattr(args, "use_clause", True)
 
     from tqdm import tqdm
     for idx, q in enumerate(tqdm(df['Question'], desc="Inference")):
-        # === 핵심 변경: 혼합 검색 + rerank 사용 ===
-        prompt, gen, passages, hits, use_context, contexts = answer_with_rag(
+
+        prompt, gen, passages, hits, use_context, contexts, meta_dbg = answer_with_rag(
             q,
-            retr,
-            pipe,
+            retrieverA=retrA,
+            retrieverB=retrB,
+            pipe=pipe,
             top_k=top_k,
             score_threshold=score_threshold,
-            reranker=reranker,                 # ★ 추가
-            rerank_threshold=rerank_threshold, # ★ 추가
-            M_generic=M_generic,               # ★ 추가
-            M_filtered=M_filtered,             # ★ 추가
+            reranker=reranker,
+            rerank_threshold=rerank_threshold,
+            M_generic=M_generic,
+            M_filtered=M_filtered,
+            M_generic_B=M_generic_B,
+            keep_for_ce=keep_for_ce,
+            use_clause=use_clause,
         )
 
         ans = extract_answer_only(gen, original_question=q, prompt=prompt)
@@ -900,13 +1097,19 @@ def cmd_run(args):
         generated_texts.append(gen)
 
         # (옵션) 디버깅용 메타 저장
-        try:
-            srcs = retr.get_sources(hits)
-            top_sources.append(srcs[:top_k])
-            top_scores.append([float(s) for _, s in hits[:top_k]])
-        except Exception:
-            top_sources.append([])
-            top_scores.append([])
+        if meta_dbg is not None:
+            # 멀티 인덱스 경로: answer_with_rag에서 이미 source와 점수를 제공
+            top_sources.append([(d["retriever"], d["source"]) for d in meta_dbg[:top_k]])
+            top_scores.append([float(d["score"]) for d in meta_dbg[:top_k]])
+        else:
+            # 단일 인덱스 폴백 경로
+            try:
+                srcs = retrA.get_sources(hits)
+                top_sources.append(srcs[:top_k])
+                top_scores.append([float(s) for _, s in hits[:top_k]])
+            except Exception:
+                top_sources.append([])
+                top_scores.append([])
 
     # 4) 제출 파일 저장
     experiment_name = "result.csv"
@@ -929,6 +1132,7 @@ def cmd_run(args):
     result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
+
 
 
 
