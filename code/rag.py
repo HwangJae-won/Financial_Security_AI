@@ -59,7 +59,7 @@ CHUNK_SIZE = 700        # 청크 길이(문자 수 기준)
 CHUNK_OVERLAP = 50     # 청크 겹침
 TOP_K = 1             # 검색 상위 k개
 
-SCORE_THRESHOLD = 0.5
+SCORE_THRESHOLD = 0.7
 OUTPUT_PATH = "results/"
 
 
@@ -972,7 +972,7 @@ def cmd_ask(args):
     # 2) Reranker 준비
     rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
-    reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=512)
+    reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=800)
 
     # 3) 하이퍼파라미터
     top_k = getattr(args, "top_k", TOP_K)
