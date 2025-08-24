@@ -1,13 +1,10 @@
-import os
-import re
-from typing import List, Tuple, Dict, Optional
-from tqdm import tqdm
-from transformers import pipeline
+import os , e
+from typing import List, Optional
+
+from sentence_transformers import CrossEncoder
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma as LangchainChroma
-import chromadb
-import torch
-from sentence_transformers import CrossEncoder, SentenceTransformer
+
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # text_utils와 utils 모듈에서 필요한 함수들을 import
@@ -17,7 +14,13 @@ from prompt import make_prompt_rag_exaone
 # rag.py
 from utils import load_and_chunk_file, load_all_documents, extract_metadata_from_filename
 # config 모듈에서 변수 import (필요에 따라 수정)
-from config import EMBEDDING_MODEL_NAME, SCORE_THRESHOLD, TOP_K, LAW_PATH, CHROMA_PERSIST_DIRECTORY
+from config import EMBEDDING_MODEL_NAME, LAW_PATH, CHROMA_PERSIST_DIRECTORY
+
+# -----------------------------
+# 검색/리랭커 기본 설정 (config.py에서 분리)
+# -----------------------------
+TOP_K = 1
+SCORE_THRESHOLD = 0.89
 
 TOP_K_MC_DEFAULT=15
 SCORE_THRESHOLD_MC_DEFAULT = 0.85
@@ -243,7 +246,7 @@ def setup_retriever(folder_path="laws/"):
         if not docs:
             raise ValueError("문서 청크가 생성되지 않았습니다.")
         print(f"✨ 임베딩 모델 로딩 중: {EMBEDDING_MODEL_NAME}")
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={"device": "cuda"}, encode_kwargs={"normalize_embeddings": True})
         print("🔍 벡터 스토어(ChromaDB) 생성 중...")
         vectorstore = LangchainChroma.from_documents(
             docs, embeddings, persist_directory=CHROMA_PERSIST_DIRECTORY
@@ -251,7 +254,7 @@ def setup_retriever(folder_path="laws/"):
         print("✅ 벡터 스토어 완료.")
     else:
         print(f"✨ 임베딩 모델 로딩 중: {EMBEDDING_MODEL_NAME}")
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={"device": "cuda"}, encode_kwargs={"normalize_embeddings": True})
         
         vectorstore = LangchainChroma(
             persist_directory=CHROMA_PERSIST_DIRECTORY,

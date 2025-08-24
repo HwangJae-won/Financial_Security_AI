@@ -1,61 +1,70 @@
-# 필요한 라이브러리들을 import 합니다.
-# from langchain_community.llms import LlamaCpp
-# from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from sentence_transformers import CrossEncoder 
 import torch, os
-from config import CACHE_DIR, MODEL_NAME
-#LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
-# CACHE_DIR = "/workspace/models/EXAONE-Deep-7.8B"
-os.environ['HUGGINGFACE_HUB_CACHE'] = '/dev/shm/huggingface_cache'
+from config import CACHE_DIR, MODEL_NAME, OFFLINE, RERANKER_MODEL_NAME
 
-def load_llm_and_tokenizer(model_name, cache_dir):
+def load_llm_and_tokenizer(
+    model_name: str = MODEL_NAME,
+    cache_dir: str = CACHE_DIR,
+    offline: bool = OFFLINE,
+):
     """
-    Hugging Face Hub에서 모델을 다운로드하여 지정된 캐시에 저장합니다.
+    모델과 토크나이저를 로컬 캐시에서 로드
+    오프라인 환경 지원을 위해 HF_HUB_OFFLINE 및 local_files_only를 활용
     """
-    print(f"'{cache_dir}'에 모델과 토크나이저를 다운로드합니다...")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+    if offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        local_files_only = True
+    else:
+        local_files_only = False
+
+    print(f"[load_llm_and_tokenizer] cache_dir={cache_dir}, offline={offline}")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
+        local_files_only=local_files_only,
+    )
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
     model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                cache_dir=cache_dir,
-                torch_dtype=torch.bfloat16,
-                trust_remote_code=True,
-                device_map="auto"
-            )
+        model_name,
+        cache_dir=cache_dir,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        device_map="auto",
+        local_files_only=local_files_only,
+    )
+    model.eval()
     print("✅ 모델 및 토크나이저 로딩 완료!")
-
     return model, tokenizer
 
-from sentence_transformers import CrossEncoder # Reranker 모델 import
-def load_reranker_model(model_name: str = "Alibaba-NLP/gte-multilingual-reranker-base"):
+
+def build_text_generator(model, tokenizer, max_new_tokens: int = 512, temperature: float = 0.2, top_p: float = 0.9):
+    """
+    text-generation 파이프라인을 생성합니다.
+    """
+    device = 0 if torch.cuda.is_available() else -1
+    pad_id = tokenizer.eos_token_id if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+    return pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        max_new_tokens=max_new_tokens,
+        do_sample=temperature > 0,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=pad_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+def load_reranker_model(model_name: str = RERANKER_MODEL_NAME):
     """
     리랭커 모델을 로드합니다.
+    오프라인 환경에서는 미리 캐시된 가중치를 사용합니다(HF_HUB_OFFLINE=1 설정에 따름).
     """
-    # model = CrossEncoder(model_name, max_length=512)
-    # return model
-    return CrossEncoder(model_name, max_length=512)
-
-# def load_llm_light(model_name, model_file, cache_dir, **kwargs):
-#     """
-#     gguf 포맷의 모델 로드 for 경량화
-#     """
-    
-#     print(f"'{model_name}'에서 모델 파일을 다운로드합니다...")
-#     model_path = hf_hub_download(
-#         repo_id=MODEL_NAME,
-#         filename=MODEL_FILE,
-#         cache_dir=CACHE_DIR,
-#     )
-#     print(f"✅ 모델 파일 다운로드 완료: {model_path}")
-    
-#     print("LlamaCpp를 사용하여 모델을 로딩합니다 (안정화 설정)...")
-#     llm = LlamaCpp(
-#         model_path=model_path,
-#         n_gpu_layers=-1,
-#         n_ctx=4096,
-#         verbose=True,
-#         **kwargs # 재시도 파라미터를 받아서 초기화
-#     )
-#     print("✅ GGUF 모델 로딩 완료!")
-#     return llm
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return CrossEncoder(model_name, max_length=512, device=device)

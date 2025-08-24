@@ -1,22 +1,50 @@
 import os
 
+# -----------------------------
+# 데이터 경로 설정
+# -----------------------------
 DATA_PATH = "data/"
-FAISS_INDEX_PATH = "faiss_index"
-LAW_PATH = "laws/"  # 실제 폴더 구조에 맞게 수정
-
-# 현재 사용 모델
-MODEL_NAME = "LGAI-EXAONE/EXAONE-Deep-7.8B"
-EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
-LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
-CACHE_DIR = "/dev/shm/models/EXAONE-Deep-7.8B"
-TMP_DIR = "/dev/shm/tmp"
+LAW_PATH = "laws/" 
 CHROMA_PERSIST_DIRECTORY = "chroma_db"
-TOP_K = 1
-SCORE_THRESHOLD = 0.89
 
+# -----------------------------
+# 모델 관련 설정
+# -----------------------------
+MODEL_NAME = "LGAI-EXAONE/EXAONE-Deep-7.8B"
+EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
 
-# 실험/참고용 모델
-# SOLAR_MODEL_NAME = "QuantFactory/SOLAR-10.7B-Instruct-v1.0-GGUF"
-# SOLAR_MODEL_FILE = "SOLAR-10.7B-Instruct-v1.0.Q8_0.gguf"
-# EXAONE_GGUF_MODEL_NAME = "Mungert/EXAONE-Deep-7.8B-GGUF"
-# EXAONE_GGUF_MODEL_FILE = "EXAONE-Deep-7.8B-q8_0.gguf"
+# -----------------------------
+# 모델 캐시 경로 설정 (환경변수 기반)
+# -----------------------------
+# 환경변수 MODEL_CACHE가 있으면 그것 사용
+# 없으면 기본 경로로 /root/.cache/huggingface 사용
+CACHE_DIR = os.environ.get(
+    "MODEL_CACHE",
+    "/root/.cache/huggingface/EXAONE-Deep-7.8B"
+)
+
+# 임시 파일/작업 디렉토리
+
+TMP_DIR = os.environ.get(
+    "TMP_DIR",
+    "/dev/shm/tmp"
+)
+
+# -----------------------------
+# 실행 환경 플래그 및 캐시/오프라인 설정
+# -----------------------------
+# 오프라인(대회 환경)에서 네트워크 호출을 막기 위한 플래그
+OFFLINE = os.environ.get("HF_HUB_OFFLINE", "1") == "1"
+
+# 캐시/작업 디렉토리 존재 보장
+os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+# 허깅페이스 캐시 경로를 통일
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", CACHE_DIR)
+os.environ.setdefault("TRANSFORMERS_CACHE", CACHE_DIR)
+os.environ.setdefault("HF_HOME", CACHE_DIR)
+if OFFLINE:
+    os.environ["HF_HUB_OFFLINE"] = "1"
