@@ -1,16 +1,16 @@
-# main.py 파일 전체 내용
-
 import sys
 import os
+import re
 import pandas as pd
 from tqdm import tqdm
 
-from rag import setup_retriever, answer_with_rag, rerank_documents
+from rag import setup_retriever, answer_with_rag, rerank_documents, answer_with_rag_multi, TOP_K, SCORE_THRESHOLD
 from model import load_llm_and_tokenizer, load_reranker_model
 
 from config import (
-    EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH, TOP_K, SCORE_THRESHOLD,
-    MODEL_NAME, CACHE_DIR, LOCAL_DIR_EXAONE
+    EMBEDDING_MODEL_NAME, DATA_PATH, LAW_PATH,
+    MODEL_NAME, CACHE_DIR, LOCAL_DIR_EXAONE,
+    CHROMA_LAWS_DIR, CHROMA_SUPP_DIR, SUPP_PATH
 )
 
 os.environ['HUGGINGFACE_HUB_CACHE'] = '/dev/shm/huggingface_cache'
@@ -22,8 +22,14 @@ def main_rerank():
     print("✨ Reranker 모델 로딩 중")
     reranker_model = load_reranker_model()
 
-    # 기존 RAG 파이프라인
-    retriever = setup_retriever(folder_path=LAW_PATH)
+    # 기존 RAG 파이프라인 (멀티 인덱스)
+    retrieverA = setup_retriever(folder_path=LAW_PATH, persist_dir=CHROMA_LAWS_DIR)
+    if os.path.isdir(SUPP_PATH) and any(name.lower().endswith((".pdf", ".txt")) for name in os.listdir(SUPP_PATH)):
+        retrieverB = setup_retriever(folder_path=SUPP_PATH, persist_dir=CHROMA_SUPP_DIR)
+    else:
+        print("⚠️ supplement 말뭉치 없음 → laws 인덱스를 B로 재사용")
+        retrieverB = retrieverA
+
     llm, tokenizer = load_llm_and_tokenizer(MODEL_NAME, CACHE_DIR)
     print("--- ✅ RAG 및 LLM 초기 설정 완료 ---\n")
 
@@ -33,39 +39,32 @@ def main_rerank():
     print("--- Rerank 기반 추론 시작 ---")
 
     preds = []
-    
-    # 리랭크는 넓게 검색하고 좁게 필터링하는 전략을 사용합니다.
-    WIDE_TOP_K = 50 # 1차 검색에서 가져올 문서 수
-    FINAL_TOP_K = 5 # 리랭킹 후 LLM에 전달할 문서 수
+
+    TOP_K_FINAL = 5
+    SCORE_THRESHOLD_SUB = 0.75
+    RERANK_THRESHOLD_MC = 0.0
+    M_GENERIC_A = 20
+    M_FILTERED_A = 10
+    M_GENERIC_B = 20
+    KEEP_FOR_CE = 50
 
     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Rerank 추론 진행"):
         question = row['Question']
 
-        # 1. 1차 검색 (넓게 가져오기)
-        print(f"🔍 1차 검색: {WIDE_TOP_K}개 문서 가져오기...")
-        retrieved_docs_with_scores = retriever.similarity_search_with_score(
-            question, 
-            k=WIDE_TOP_K
-        )
-        retrieved_docs = [doc for doc, _ in retrieved_docs_with_scores]
-        
-        # 2. 재순위화 모듈을 사용하여 문서의 순위를 재조정합니다.
-        print(f"🔄 문서 재순위화 중...")
-        reranked_docs = rerank_documents(
-            query=question, 
-            documents=retrieved_docs, 
-            reranker_model=reranker_model, 
-            k=FINAL_TOP_K
-        )
-
-        # 3. 재순위화된 문서들을 컨텍스트로 사용하여 답변 생성
-        final_answer = answer_with_rag(
-            question=question, 
-            vectorstore=retriever, # answer_with_rag 함수는 vectorstore 인자를 필요로 하므로 전달
-            model=llm, 
+        final_answer = answer_with_rag_multi(
+            question=question,
+            retrieverA=retrieverA,
+            retrieverB=retrieverB,
+            model=llm,
             tokenizer=tokenizer,
-            top_k=FINAL_TOP_K, # reranking 이후의 최종 top_k 전달
-            reranked_docs=reranked_docs
+            top_k=TOP_K_FINAL,
+            score_threshold=SCORE_THRESHOLD_SUB,
+            reranker=reranker_model,
+            rerank_threshold=RERANK_THRESHOLD_MC,
+            M_generic_A=M_GENERIC_A,
+            M_filtered_A=M_FILTERED_A,
+            M_generic_B=M_GENERIC_B,
+            keep_for_ce=KEEP_FOR_CE
         )
         
         preds.append(final_answer)

@@ -1,7 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from sentence_transformers import CrossEncoder 
 import torch, os
-from config import CACHE_DIR, MODEL_NAME, OFFLINE, RERANKER_MODEL_NAME
+from config import CACHE_DIR, MODEL_NAME, OFFLINE, RERANKER_MODEL_NAME, LOCAL_DIR_EXAONE
 
 def load_llm_and_tokenizer(
     model_name: str = MODEL_NAME,
@@ -12,6 +12,13 @@ def load_llm_and_tokenizer(
     모델과 토크나이저를 로컬 캐시에서 로드
     오프라인 환경 지원을 위해 HF_HUB_OFFLINE 및 local_files_only를 활용
     """
+    # Prefer a local directory if available (offline-friendly)
+    resolved_name = model_name
+    for cand in [model_name, LOCAL_DIR_EXAONE]:
+        if isinstance(cand, str) and os.path.isdir(cand):
+            resolved_name = cand
+            break
+
     if offline:
         os.environ["HF_HUB_OFFLINE"] = "1"
         local_files_only = True
@@ -21,7 +28,7 @@ def load_llm_and_tokenizer(
     print(f"[load_llm_and_tokenizer] cache_dir={cache_dir}, offline={offline}")
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
+        resolved_name,
         cache_dir=cache_dir,
         trust_remote_code=True,
         local_files_only=local_files_only,
@@ -30,7 +37,7 @@ def load_llm_and_tokenizer(
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        resolved_name,
         cache_dir=cache_dir,
         trust_remote_code=True,
         torch_dtype=dtype,
@@ -67,4 +74,13 @@ def load_reranker_model(model_name: str = RERANKER_MODEL_NAME):
     오프라인 환경에서는 미리 캐시된 가중치를 사용합니다(HF_HUB_OFFLINE=1 설정에 따름).
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    return CrossEncoder(model_name, max_length=512, device=device)
+    path = model_name
+    if isinstance(model_name, str) and os.path.isdir(model_name):
+        path = model_name
+    else:
+        # heuristic local guess: /workspace/models/<basename>
+        import os as _os
+        guess = _os.path.join("/workspace/models", _os.path.basename(model_name))
+        if _os.path.isdir(guess):
+            path = guess
+    return CrossEncoder(path, max_length=512, device=device)

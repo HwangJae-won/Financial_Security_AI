@@ -1,5 +1,7 @@
-import re
+import re, os
 from typing import List, Tuple, Dict, Optional
+from langchain_core.documents import Document
+from text_utils import load_pdf_text, chunk_law_text, _clean_text
 OPTION_PATTERN = re.compile(r"^\s*[1-9][0-9]?\s")
 
 def is_multiple_choice(question_text):
@@ -77,7 +79,7 @@ def load_and_chunk_file(file_path: str, filename: str):
         print(f"⚠️ 경고: '{file_path}'에서 텍스트를 추출하지 못했습니다.")
         return []
     chunks, labels = chunk_law_text(_clean_text(raw_text))
-    file_metadata = _extract_metadata_from_filename(filename)
+    file_metadata = extract_metadata_from_filename(filename)
     return [
         Document(page_content=chunk, metadata={**file_metadata, "source": file_path, "label": label})
         for chunk, label in zip(chunks, labels)

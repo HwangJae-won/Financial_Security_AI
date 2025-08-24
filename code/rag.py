@@ -1,19 +1,18 @@
-import os , e
+import os
+import re
 from typing import List, Optional
 
 from sentence_transformers import CrossEncoder
+
 from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma as LangchainChroma
-
 from langchain_huggingface import HuggingFaceEmbeddings
 
-# text_utils와 utils 모듈에서 필요한 함수들을 import
 from text_utils import load_pdf_text, chunk_law_text, _clean_text
 from utils import extract_answer_only, is_multiple_choice, clean_markdown
 from prompt import make_prompt_rag_exaone
-# rag.py
 from utils import load_and_chunk_file, load_all_documents, extract_metadata_from_filename
-# config 모듈에서 변수 import (필요에 따라 수정)
+
 from config import EMBEDDING_MODEL_NAME, LAW_PATH, CHROMA_PERSIST_DIRECTORY
 
 # -----------------------------
@@ -26,7 +25,83 @@ TOP_K_MC_DEFAULT=15
 SCORE_THRESHOLD_MC_DEFAULT = 0.85
 TOP_K_SUB_DEFAULT = 30
 SCORE_THRESHOLD_SUB_DEFAULT = 0.75
+def _rrf(rank: int, k: int = 60): return 1.0 / (k + rank)
 
+def _fuse_rrf(cands_lists, keep_for_ce=50):
+    merged = {}
+    for cands in cands_lists:
+        for rank, c in enumerate(cands, 1):
+            key = c["source"]
+            merged.setdefault(key, {**c, "rrf":0.0})
+            merged[key]["rrf"] += _rrf(rank)
+    return sorted(merged.values(), key=lambda x: x["rrf"], reverse=True)[:keep_for_ce]
+
+def _search_global(vs, q, k, tag):
+    res = vs.similarity_search_with_score(q, k=k)
+    return [{"text":d.page_content, "score":float(s),
+             "source":d.metadata.get("source","unknown"), "retriever":tag} for d,s in res]
+
+def _search_filtered_by_law(vs, q, law_name, k, tag):
+    if not law_name: return []
+    res = vs.similarity_search_with_score(q, k=k, filter={"law_name": law_name})
+    if not res:
+        res = vs.similarity_search_with_score(q, k=k, filter={"law": law_name})
+    return [{"text":d.page_content, "score":float(s),
+             "source":d.metadata.get("source","unknown"), "retriever":tag} for d,s in res]
+
+def _rerank(query, candidates, reranker, topn=1, batch_size=32):
+    if not candidates: return []
+    pairs = [(query, c["text"]) for c in candidates]
+    scores = reranker.predict(pairs, batch_size=batch_size, convert_to_numpy=True)
+    for c, s in zip(candidates, scores): c["ce_score"] = float(s)
+    return sorted(candidates, key=lambda x: x["ce_score"], reverse=True)[:topn]
+
+def answer_with_rag_multi(question, retrieverA, retrieverB, model, tokenizer,
+                          top_k=1, score_threshold=0.75,
+                          reranker=None, rerank_threshold=0.0,
+                          M_generic_A=20, M_filtered_A=10, M_generic_B=20, keep_for_ce=50):
+    is_mc, _ = is_multiple_choice(question)
+    law_hint = _extract_law_name_from_question(question)  # 기존 함수 재사용
+
+    cand_gA = _search_global(retrieverA, question, M_generic_A, "A")
+    cand_fA = _search_filtered_by_law(retrieverA, question, law_hint, M_filtered_A, "A")
+    cand_gB = _search_global(retrieverB, question, M_generic_B, "B")
+
+    fused = _fuse_rrf([cand_fA, cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+
+    if reranker and fused:
+        ranked = _rerank(question, fused, reranker, topn=max(1, top_k))
+        top_score = ranked[0]["ce_score"]
+        gate_ok = (top_score >= (rerank_threshold if is_mc else score_threshold))
+    else:
+        ranked = sorted(fused, key=lambda x: x["score"], reverse=True)[:max(1, top_k)]
+        top_score = ranked[0]["score"] if ranked else float("-inf")
+        gate_ok = (top_score >= score_threshold)
+
+    contexts = [c["text"] for c in ranked[:top_k]] if gate_ok else []
+    prompt = make_prompt_rag_exaone(text=question, contexts=contexts, use_fewshot=True)
+
+    # 1차 greedy
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    out = model.generate(**inputs, max_new_tokens=(2 if is_mc else 256), do_sample=False)
+    gen = tokenizer.decode(out[0], skip_special_tokens=True)
+    ans = extract_answer_only(clean_markdown(gen), original_question=question, prompt=prompt)
+    if ans not in ("0","미응답"): return ans
+
+    # 2차 샘플링
+    outs = model.generate(**inputs, max_new_tokens=(2 if is_mc else 256),
+                          do_sample=True, temperature=0.6, top_p=0.95,
+                          num_return_sequences=3, repetition_penalty=1.05)
+    for o in outs:
+        cand = tokenizer.decode(o, skip_special_tokens=True)
+        a = extract_answer_only(cand, original_question=question, prompt=prompt)
+        if a not in ("0","미응답"): return a
+
+    if is_mc:
+        out = model.generate(**inputs, max_new_tokens=128, do_sample=True, temperature=0.6, top_p=0.95)
+        gen2 = tokenizer.decode(out[0], skip_special_tokens=True)
+        return extract_answer_only(gen2, original_question=question, prompt=prompt)
+    return "미응답"
 def rerank_documents(query: str, documents: List[Document], reranker_model: CrossEncoder, k: int) -> List[Document]:
     """
     쿼리와 문서들을 리랭킹 모델로 재순위화하고 상위 k개 문서를 반환합니다.
@@ -236,9 +311,11 @@ def answer_with_rag(
     print("Final Answer:", final_answer)
     return final_answer
 
-def setup_retriever(folder_path="laws/"):
+def setup_retriever(folder_path="laws/", persist_dir=None):
     print(f"📄 '{folder_path}' 폴더에서 문서를 로딩하고 벡터화합니다.")
-    if not os.path.exists(CHROMA_PERSIST_DIRECTORY):
+    if persist_dir is None:
+        persist_dir = CHROMA_PERSIST_DIRECTORY
+    if not os.path.exists(persist_dir):
         if not os.path.exists(folder_path):
             raise FileNotFoundError(f"'{folder_path}' 폴더를 찾을 수 없습니다.")
         docs = load_all_documents(folder_path)
@@ -249,7 +326,7 @@ def setup_retriever(folder_path="laws/"):
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={"device": "cuda"}, encode_kwargs={"normalize_embeddings": True})
         print("🔍 벡터 스토어(ChromaDB) 생성 중...")
         vectorstore = LangchainChroma.from_documents(
-            docs, embeddings, persist_directory=CHROMA_PERSIST_DIRECTORY
+            docs, embeddings, persist_directory=persist_dir
         )
         print("✅ 벡터 스토어 완료.")
     else:
@@ -257,7 +334,7 @@ def setup_retriever(folder_path="laws/"):
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME, model_kwargs={"device": "cuda"}, encode_kwargs={"normalize_embeddings": True})
         
         vectorstore = LangchainChroma(
-            persist_directory=CHROMA_PERSIST_DIRECTORY,
+            persist_directory=persist_dir,
             embedding_function=embeddings
         )
         
@@ -269,14 +346,14 @@ def setup_retriever(folder_path="laws/"):
                 print("⚠️ 경고: 로드된 ChromaDB 인덱스가 비어 있습니다. 인덱스를 다시 생성합니다.")
                 # 비어 있는 인덱스 폴더를 삭제하고 함수를 재귀적으로 호출하여 재생성
                 import shutil
-                shutil.rmtree(CHROMA_PERSIST_DIRECTORY)
-                return setup_retriever(folder_path)
+                shutil.rmtree(persist_dir)
+                return setup_retriever(folder_path, persist_dir=persist_dir)
             
             print(f"✅ ChromaDB 인덱스 로드 완료. 문서 수: {doc_count}")
         except Exception as e:
             print(f"❌ 오류: ChromaDB 로드 중 오류 발생 ({e}). 인덱스가 손상된 것으로 보입니다. 다시 생성합니다.")
             import shutil
-            shutil.rmtree(CHROMA_PERSIST_DIRECTORY)
-            return setup_retriever(folder_path)
+            shutil.rmtree(persist_dir)
+            return setup_retriever(folder_path, persist_dir=persist_dir)
         
     return vectorstore

@@ -6,6 +6,9 @@ import os
 DATA_PATH = "data/"
 LAW_PATH = "laws/" 
 CHROMA_PERSIST_DIRECTORY = "chroma_db"
+INDEX_BASE_DIR = "rag_index"    
+INDEX_NS_LAWS = "laws"
+INDEX_NS_SUPP = "supplement"
 
 # -----------------------------
 # 모델 관련 설정
@@ -14,6 +17,12 @@ MODEL_NAME = "LGAI-EXAONE/EXAONE-Deep-7.8B"
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 LOCAL_DIR_EXAONE = "/workspace/models/EXAONE-Deep-7.8B"
+
+
+CHROMA_LAWS_DIR = os.path.join(INDEX_BASE_DIR, "laws")
+CHROMA_SUPP_DIR = os.path.join(INDEX_BASE_DIR, "supplement")
+SUPP_PATH = "supplement/"
+
 
 # -----------------------------
 # 모델 캐시 경로 설정 (환경변수 기반)
