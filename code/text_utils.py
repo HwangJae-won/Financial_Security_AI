@@ -4,6 +4,8 @@ from typing import List
 import pdfplumber
 import pikepdf 
 
+import contextlib
+
 from config import CHUNK_SIZE, CHUNK_OVERLAP
 
 
@@ -11,22 +13,99 @@ def _ensure_dir(d: str):
     if not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
+# def load_pdf_text(pdf_path: str) -> str:
+#     try:
+#         with pdfplumber.open(pdf_path) as pdf:
+#             return "\n".join(p.extract_text() or "" for p in pdf.pages)
+#     except Exception:
+#         # 1) 임시 수리본 저장
+#         tmp = pdf_path + ".fixed"
+#         with pikepdf.open(pdf_path, allow_overwriting_input=True) as doc:
+#             doc.save(tmp, linearize=True)
+#         # 2) 원본을 수리본으로 원자적 교체 → 이후 모든 단계가 같은 경로(원래 경로)를 사용
+#         os.replace(tmp, pdf_path)
+
+#         # 3) 다시 열기
+#         with pdfplumber.open(pdf_path) as pdf:
+#             return "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+
 def load_pdf_text(pdf_path: str) -> str:
+    # 0) 1차: pdfplumber (pdfminer 기반)
     try:
         with pdfplumber.open(pdf_path) as pdf:
             return "\n".join(p.extract_text() or "" for p in pdf.pages)
-    except Exception:
-        # 1) 임시 수리본 저장
-        tmp = pdf_path + ".fixed"
-        with pikepdf.open(pdf_path, allow_overwriting_input=True) as doc:
+    except Exception as e1:
+        first_err = e1  # 마지막에 메시지로 남김
+
+    # 1) 2차: pikepdf로 임시 수리본 만들기(원본은 그대로, 성공 시에만 교체)
+    tmp = pdf_path + ".fixed.pdf"
+    try:
+        with pikepdf.open(pdf_path) as doc:
             doc.save(tmp, linearize=True)
-        # 2) 원본을 수리본으로 원자적 교체 → 이후 모든 단계가 같은 경로(원래 경로)를 사용
+        # 수리본 열어보기
+        with pdfplumber.open(tmp) as pdf:
+            text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+        # 문제 없으면 원자적 교체
         os.replace(tmp, pdf_path)
+        return text
+    except Exception:
+        with contextlib.suppress(Exception):
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
-        # 3) 다시 열기
-        with pdfplumber.open(pdf_path) as pdf:
-            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    # 2) 3차: PyMuPDF (깨진 PDF에 강함)
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(pdf_path)
+        text = "\n".join(page.get_text("text") or "" for page in doc)
+        if text.strip():
+            return text
+    except Exception:
+        pass
 
+    # 3) 4차: pypdf (strict=False) 시도
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(pdf_path, strict=False)
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    # 4) 5차: pypdfium2 (PDFium 바인딩)
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+        out = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            tp = page.get_textpage()
+            out.append(tp.get_text_range())
+            tp.close()
+        text = "\n".join(out)
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    # 5) (옵션) OCR 폴백: 환경변수 ENABLE_OCR=1일 때만
+    try:
+        if os.environ.get("ENABLE_OCR", "0") == "1":
+            from pdf2image import convert_from_path
+            import pytesseract
+            pages = convert_from_path(pdf_path, dpi=300)
+            text = "\n".join(pytesseract.image_to_string(img, lang="kor+eng") for img in pages)
+            if text.strip():
+                return text
+    except Exception:
+        pass
+
+    # 모두 실패
+    raise RuntimeError(
+        f"Failed to extract text from {pdf_path}. First error was {type(first_err).__name__}: {first_err}"
+    )
 
 
 BULLET_MAP = {

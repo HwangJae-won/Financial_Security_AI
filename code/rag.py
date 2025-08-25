@@ -172,7 +172,7 @@ class RAGIndexer:
             if use_kind == "law":
                 chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
             else:
-                chunks, labels = _chunk_generic(raw, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+                chunks, labels = _chunk_generic(raw, chunk_size=CHUNK_SIZE-100, overlap=CHUNK_OVERLAP)
 
             base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
@@ -567,7 +567,7 @@ def answer_with_rag(
     # --- 3) 1차 생성 ---
     try:
         if is_mc:
-            out = pipe(prompt, max_new_tokens=2, do_sample=False)
+            out = pipe(prompt, max_new_tokens=20, do_sample=False)
         else:
             out = pipe(prompt, max_new_tokens=256, do_sample=False)
         gen = out[0]["generated_text"]
