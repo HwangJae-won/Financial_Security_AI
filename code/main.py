@@ -1,8 +1,8 @@
 """
     # 1) 인덱스 빌드
     !python code/main.py build --pdf "data/전자금융거래법(법률)(제19734호)(20240915).pdf"
-    !python code/main.py build --dir "laws/"
-    !python code/main.py build --dir "supplement/"
+    !python code/main.py build --dir "laws/" --kind "law"
+    !python code/main.py build --dir "supplement/" --kind "generic"
     
     # 2) 단일 질문
     !python code/main.py ask --question "전자자금이체의 지급 효력 발생 시점을 전자금융거래법 기준에 따라 설명하세요."
@@ -55,7 +55,9 @@ def cmd_build(args):
         ns = "default"
     out_dir = os.path.join(INDEX_DIR, ns)
 
-    indexer.build_many(pdfs, index_dir=out_dir)   # ← 여기!
+    kind = getattr(args, "kind", "auto")  # 기본 auto 권장
+    
+    indexer.build_many(pdfs, index_dir=out_dir, kind=kind)
 
 
 
@@ -240,6 +242,8 @@ def main():
     p_build = sub.add_parser("build", help="PDF에서 인덱스 생성(여러 개 가능)")
     p_build.add_argument("--pdf", nargs="+", help="PDF 파일 경로(공백으로 여러 개)")
     p_build.add_argument("--dir", help="PDF 폴더 경로(내부 *.pdf 일괄)")
+    p_build.add_argument("--kind", type=str, choices=["law","generic","auto"], default="auto",
+                         help="법령 전용 패턴(law) / 일반 PDF(generic) / 자동 판별(auto)")
     p_build.set_defaults(func=cmd_build)
 
     p_ask = sub.add_parser("ask", help="단일 질문에 RAG 적용")

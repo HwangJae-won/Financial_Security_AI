@@ -16,7 +16,7 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 # 기존 프로젝트 모듈
 from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only
 from prompt import make_prompt_rag_exaone 
-from text_utils import _ensure_dir, load_pdf_text, chunk_law_text
+from text_utils import _ensure_dir, load_pdf_text, chunk_law_text, _chunk_generic
 from config import (
     CHUNK_SIZE, CHUNK_OVERLAP, TOP_K, SCORE_THRESHOLD, M_GENERIC, M_FILTERED, OUTPUT_PATH, CHROMA_COLLECTION,
     MODEL_NAME, INDEX_DIR, RERANK_THRESHOLD
@@ -145,13 +145,16 @@ def _sanitize_meta(d: dict) -> dict:
             out[k] = str(v)  # 혹시 모를 비허용 타입 방지
     return out
 
+def _guess_kind_from_text(t: str) -> str:
+    # 간단 휴리스틱: '제 n 조' 패턴 많으면 법령으로 간주
+    return "law" if re.search(r"제\s*\d+\s*조", t) else "generic"
 
 class RAGIndexer:
     def __init__(self, model_name=MODEL_NAME, device=None):
         self.model_name = model_name
         self.embedder = E5Embedder(MODEL_NAME, device='cpu')
 
-    def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR):
+    def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR, kind: str = "law"):
         all_chunks, all_sources = [], []
         metas = []   # ★ 추가: 청크별 메타 담을 리스트
         total = 0
@@ -161,23 +164,42 @@ class RAGIndexer:
             if not raw.strip():
                 raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
 
-            print("🔪 '제n조' 단위 청크 분할 중...")
-            chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+            
+            # kind 자동 추정(명시 인자가 'auto'면 추정, 아니면 그대로 사용)
+            use_kind = _guess_kind_from_text(raw) if kind == "auto" else kind
+
+            print(f"🔪 청크 분할 ({use_kind}) 중...")
+            if use_kind == "law":
+                chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
+            else:
+                chunks, labels = _chunk_generic(raw, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
 
             base = os.path.basename(pdf_path)
             all_chunks.extend(chunks)
             all_sources.extend([f"{base}::{label}" for label in labels])
-            # ★ 추가: 라벨→메타 파싱 + 법령명 주입
-            law_name = _norm_law_name_from_filename(base)
-            for lbl in labels:
-                m = _parse_label_to_meta(lbl)
-                m.update({
-                    "law": law_name,                # 필터에 쓸 법령명
-                    "source": f"{base}::{lbl}",     # 표시용
-                })
-                metas.append(_sanitize_meta(m))
+            
+            # --- 메타 작성 ---
+            if use_kind == "law":
+                law_name = _norm_law_name_from_filename(base)
+                for lbl in labels:
+                    m = _parse_label_to_meta(lbl)  # (조/항 숫자 추출; 없으면 None들)
+                    m.update({
+                        "law": law_name,
+                        "source": f"{base}::{lbl}",
+                        "doc_type": "law",
+                        "filename": base,
+                    })
+                    metas.append(_sanitize_meta(m))
+            else:
+                for lbl in labels:
+                    metas.append(_sanitize_meta({
+                        "source": f"{base}::{lbl}",
+                        "doc_type": "attachment",
+                        "filename": base,
+                    }))
+                    
             total += len(chunks)
-            print(f"  → {base}: 조/항 기준 {len(chunks)}개")
+            print(f"  → {base}: {use_kind} 기준 {len(chunks)}개")
 
         if total == 0:
             raise ValueError("인덱싱할 청크가 없습니다.")
@@ -209,12 +231,7 @@ class RAGIndexer:
         print("📦 ChromaDB 업서트(add) 중...")
         ids = [f"doc-{i}" for i in range(len(all_chunks))]
         assert len(metas) == len(all_chunks), f"metas({len(metas)}) != chunks({len(all_chunks)})"
-        collection.add(
-            ids=ids,
-            documents=list(all_chunks),
-            embeddings=vectors.tolist(),
-            metadatas=metas,
-        )
+        collection.add(ids=ids, documents=list(all_chunks), embeddings=vectors.tolist(), metadatas=metas)
 
         print(f"✅ 저장 완료 | 총 청크 {total}개") 
 

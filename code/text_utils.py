@@ -2,6 +2,7 @@ import os
 import re
 from typing import List
 import pdfplumber
+import pikepdf 
 
 from config import CHUNK_SIZE, CHUNK_OVERLAP
 
@@ -11,31 +12,108 @@ def _ensure_dir(d: str):
         os.makedirs(d, exist_ok=True)
 
 def load_pdf_text(pdf_path: str) -> str:
-    texts = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for p in pdf.pages:
-            t = p.extract_text() or ""
-            texts.append(t)
-    return "\n".join(texts)
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception:
+        # 1) 임시 수리본 저장
+        tmp = pdf_path + ".fixed"
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as doc:
+            doc.save(tmp, linearize=True)
+        # 2) 원본을 수리본으로 원자적 교체 → 이후 모든 단계가 같은 경로(원래 경로)를 사용
+        os.replace(tmp, pdf_path)
+
+        # 3) 다시 열기
+        with pdfplumber.open(pdf_path) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
 
 
 
+BULLET_MAP = {
+    "": "•",     # 윙딩스 점
+    "▶": "•",
+    "▷": "•",
+    "※": "•",
+    "": "•" 
+}
+def _normalize_bullets(t: str) -> str:
+    for k, v in BULLET_MAP.items():
+        t = t.replace(k, v)
+    # 줄 앞 글머리 정규화: "•" 뒤 공백 1개
+    t = re.sub(r'(?m)^\s*[•\-]\s*', "• ", t)
+    return t
 
+def _newline_before_bullets(t: str) -> str:
+    # 한 줄 안에서 처음 글자가 아닌 '•' 앞에는 개행을 넣어 각각 한 줄로 분리
+    lines = []
+    for s in t.splitlines():
+        s = re.sub(r'(?<!^)•\s*', r'\n• ', s)  # 줄 맨 앞이 아닌 불릿 앞에 \n 추가
+        lines.append(s)
+    return "\n".join(lines)
+    
+def _join_vertical_korean_blocks(t: str) -> str:
+    lines = t.splitlines()
+    out, i, n = [], 0, len(lines)
+    is_kchar = re.compile(r'^[가-힣]{1,2}$')  # 1~2글자짜리 한글 라인
+    while i < n:
+        j = i
+        while j < n and is_kchar.match(lines[j].strip() or ""):
+            j += 1
+        if j - i >= 3:  # 3줄 이상 연속이면 제목/머리말로 판단 → 결합
+            token = "".join(s.strip() for s in lines[i:j])
+            out.append(token)
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+def _despace_korean_runs(t: str) -> str:
+    # 4글자 이상 연속해서 '한글 + 공백' 패턴이면 공백 제거
+    return re.sub(r'((?:[가-힣]\s+){3,}[가-힣])',
+                  lambda m: re.sub(r'\s+', '', m.group(0)), t)
+
+def _drop_lonely_pagenums(t: str) -> str:
+    # 숫자만 있는 줄, 1~4자리 → 삭제
+    return re.sub(r'(?m)^\s*\d{1,4}\s*$', '', t)
+
+def _glue_bullet_paragraphs(t: str) -> str:
+    out, buf = [], []
+    for line in t.splitlines():
+        if line.strip().startswith("• "):
+            if buf: out.append(" ".join(buf)); buf=[]
+            out.append(line.strip())
+        elif not line.strip():
+            if buf: out.append(" ".join(buf)); buf=[]
+            out.append("")
+        else:
+            buf.append(line.strip())
+    if buf: out.append(" ".join(buf))
+    return "\n".join(out)
 
 def _clean_text(t: str) -> str:
-    # 기본 정리
-    t = t.replace("\u3000", " ").strip()
+    t = t.replace("\u3000", " ")  # 전각 공백
+    t = t.replace("\r\n","\n").replace("\r","\n")
     t = re.sub(r"[ \t]+", " ", t)
 
-    # --- "삭제<날짜>"가 포함된 '모든 줄' 제거 ---
-    # 예: "1. 삭제<2020. 2. 4.>", "제28조의6 삭제 <2023. 3. 14.>", "…삭제＜2021.1.1.＞…"
-    # - (?m): 줄 단위 매칭
-    # - .*삭제\s*[<＜][^>＞]+[>＞].*$ : 해당 줄에 '삭제<...>' 또는 '삭제＜...＞' 패턴이 있으면 그 줄 전체 삭제
+    # PDF 노이즈 정리
+    t = _join_vertical_korean_blocks(t)
+    t = _despace_korean_runs(t)
+    t = _normalize_bullets(t)
+    t = _drop_lonely_pagenums(t)
+
+    # 불릿 단락 접기(여러 줄 → 한 줄)
+    t = _glue_bullet_paragraphs(t)
+
+    # 너가 쓰던 '삭제<날짜>' 라인 제거(법령에도 그대로 유효)
     t = re.sub(r'(?m)^.*삭제\s*[<＜][^>＞]+[>＞].*$', '', t)
 
-    # 연속 빈 줄 정리 (앞에서 줄을 지웠으니 마지막에 수행)
-    t = re.sub(r"\n{3,}", "\n\n", t)
+    # 남은 공백/빈줄 정리
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t
+
+
+
 
 def _chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
     text = _clean_text(text)
@@ -191,4 +269,10 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
         for i, sc in enumerate(subchunks):
             chunks.append(sc)
             labels.append(f"{title}#{i+1}")
+    return chunks, labels
+
+
+def _chunk_generic(raw_text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    chunks = _chunk_text(raw_text, chunk_size, overlap)
+    labels = [f"chunk#{i+1}" for i in range(len(chunks))]
     return chunks, labels
