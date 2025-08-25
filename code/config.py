@@ -1,0 +1,13 @@
+CHUNK_SIZE = 700
+CHUNK_OVERLAP = 50
+TOP_K = 1     
+SCORE_THRESHOLD = 0.7
+RERANK_THRESHOLD = 0.0
+M_GENERIC = 2
+M_FILTERED = 1
+
+OUTPUT_PATH = "results/"
+CHROMA_COLLECTION = "rag_index"
+INDEX_DIR = "./rag_index"
+
+MODEL_NAME = "/workspace/models/multilingual-e5-small" 
