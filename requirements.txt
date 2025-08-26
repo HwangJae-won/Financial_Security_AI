@@ -24,7 +24,7 @@ safetensors>=0.4.3
 six==1.17.0
 sympy==1.13.3
 tokenizers>=0.19.1
-torch==2.1.0+cu118
+
 tqdm==4.67.1
 transformers==4.43.3
 triton==2.1.0

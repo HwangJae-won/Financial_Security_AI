@@ -1,50 +1,78 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-# 스크립트 실행 중 오류 발생 시 즉시 중단
-set -e
+# 프로젝트 루트로 이동
+cd "$(dirname "$0")"
 
-# --- 1. root 권한으로 실행되는 부분 ---
-echo "[SETUP] Starting system setup as root..."
+# 0) (선택) venv 활성화가 필요하면 주석 해제
+# source venv/bin/activate
 
-# 사용자 생성
-if id "myproject_user" &>/dev/null; then
-    echo "User 'myproject_user' already exists. Skipping user creation."
+# 1) RAM 세팅: 임베딩/리랭커는 /dev/shm, LLM(EXAONE)은 /root 캐시 사용
+if [[ -f "./setup_ram_models.sh" ]]; then
+  # setup_ram_models.sh는 환경변수까지 잡아줌
+  source ./setup_ram_models.sh
 else
-    useradd -m -s /bin/bash myproject_user
-    echo "User 'myproject_user' created."
+  echo "⚠️ setup_ram_models.sh 가 없습니다. 먼저 만들어 둔 스크립트를 생성/검토하세요."
+  echo "   (그래도 계속 진행하지만, 임베딩/리랭커가 RAM으로 올라가지 않을 수 있습니다)"
+  # 최소 필수 환경(LLM은 /root 캐시, 임시파일은 RAM)
+  export MODEL_CACHE="${MODEL_CACHE:-/root/.cache/huggingface}"
+  export HF_HUB_OFFLINE=1
+  export HUGGINGFACE_HUB_CACHE="$MODEL_CACHE"
+  export TRANSFORMERS_CACHE="$MODEL_CACHE"
+  export HF_HOME="$MODEL_CACHE"
+  export TMPDIR="/dev/shm/tmp"; mkdir -p "$TMPDIR"
 fi
 
-# 디렉토리 생성 및 권한 부여
-PROJECT_DIR="/var/www/Financial_Security_AI"
-mkdir -p $PROJECT_DIR
-chown -R myproject_user:myproject_user /var/www
+# 2) 하위 커맨드 파싱
+usage() {
+  cat <<USAGE
+Usage:
+  bash run_fsai.sh build_all                # laws/ 와 supplement/ 인덱스 빌드
+  bash run_fsai.sh ask "질문 내용"           # 단일 질문 추론
+  bash run_fsai.sh run data/test.csv        # CSV 일괄 추론 (컬럼명: Question)
+USAGE
+}
 
-echo "Directory permissions set for $PROJECT_DIR."
+cmd="${1:-}"; shift || true
 
-# --- 2. myproject_user 권한으로 실행되는 부분 ---
-echo "[SETUP] Running project setup as myproject_user..."
+case "$cmd" in
+  build_all)
+    echo "📦 인덱스 빌드 시작..."
+    # laws/ 는 법령 패턴
+    if [[ -d "laws" ]]; then
+      python code/main.py build --dir "laws/" --kind "law"
+    else
+      echo "⚠️ laws/ 폴더가 없습니다. 건너뜁니다."
+    fi
+    # supplement/ 는 일반 문서(있을 때만)
+    if [[ -d "supplement" ]]; then
+      python code/main.py build --dir "supplement/" --kind "generic"
+    else
+      echo "ℹ️ supplement/ 폴더가 없어 laws 인덱스만 사용합니다."
+    fi
+    echo "✅ 인덱스 빌드 완료"
+    ;;
 
-# su -c 를 사용하여 myproject_user로 명령어 실행
-# !! 중요: 보안을 위해 아래 git clone 명령어는 SSH 방식으로 변경하는 것을 강력히 권장합니다.
-# 이 스크립트에서는 토큰을 제거하고 사용자에게 직접 입력받도록 수정했습니다.
-su - myproject_user -c "
-    set -e
-    cd /var/www/
-    
-    # Git 클론 (SSH 방식 권장)
-    git clone https://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@github.com/HwangJae-won/Financial_Security_AI.git
-    
-    cd $PROJECT_DIR
-    
-    # 가상 환경 생성 및 라이브러리 설치
-    echo 'Creating Python virtual environment...'
-    python3 -m venv venv
-    
-    echo 'Installing dependencies from requirements.txt...'
-    source venv/bin/activate
-    pip install -r requirements.txt
-    
-    echo 'Setup for myproject_user is complete.'
-"
+  ask)
+    question="${1:-}"
+    if [[ -z "$question" ]]; then
+      echo "❌ 질문이 비었습니다."; usage; exit 1
+    fi
+    echo "❓ 질문: $question"
+    python code/main.py ask --question "$question"
+    ;;
 
-echo "[SUCCESS] All setup tasks are complete."
+  run)
+    csv_path="${1:-}"
+    if [[ -z "$csv_path" || ! -f "$csv_path" ]]; then
+      echo "❌ CSV 경로가 없거나 파일이 존재하지 않습니다: $csv_path"; usage; exit 1
+    fi
+    echo "🧪 CSV 일괄 추론 시작: $csv_path"
+    python code/main.py run --csv "$csv_path"
+    echo "✅ 완료. 결과는 results/result.csv 및 results/result_with_info.csv"
+    ;;
+
+  *)
+    usage; exit 1
+    ;;
+esac
