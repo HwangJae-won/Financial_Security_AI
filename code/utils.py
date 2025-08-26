@@ -1,5 +1,23 @@
 import re
 import random
+import unicodedata
+
+
+_NEG_PATTS = [
+    r"옳지\s*않", r"맞지\s*않", r"아닌\s*것", r"아니(?:다|며?)",
+    r"불가", r"금지", r"제외", r"해당하지\s*않",
+    r"옳은\s*것이\s*아닌", r"타당하지\s*않",
+    r"\bNOT\b", r"\bFALSE\b", r"\bincorrect\b", r"\bexcept\b"
+]
+
+def _nfkc_lower(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).lower()
+
+def is_negated_question(q: str) -> bool:
+    t = _nfkc_lower(q)
+    return any(re.search(p, t) for p in _NEG_PATTS)
+
+
 
 def is_multiple_choice(question_text):
     lines = question_text.strip().split("\n")

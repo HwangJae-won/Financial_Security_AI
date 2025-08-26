@@ -14,12 +14,12 @@ import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # 기존 프로젝트 모듈
-from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only
-from prompt import make_prompt_rag_exaone 
+from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only, is_negated_question
+from prompt import make_prompt_rag_exaone, make_prompt_recheck
 from text_utils import _ensure_dir, load_pdf_text, chunk_law_text, _chunk_generic
 from config import (
     CHUNK_SIZE, CHUNK_OVERLAP, TOP_K, SCORE_THRESHOLD, M_GENERIC, M_FILTERED, OUTPUT_PATH, CHROMA_COLLECTION,
-    MODEL_NAME, INDEX_DIR, RERANK_THRESHOLD
+    MODEL_NAME, INDEX_DIR, RERANK_THRESHOLD, OVERLAP_TAU
 )
   
 
@@ -109,7 +109,7 @@ class STReranker:
 
 
 # -----------------------------
-# 인덱서/검색기
+# 인덱서
 # -----------------------------
 
 
@@ -118,9 +118,25 @@ _CLAUSE_RE = re.compile(r"(?:제)?\s*(\d+)\s*항")
 
 def _norm_law_name_from_filename(base: str) -> str:
     name = os.path.splitext(base)[0]
-    name = re.sub(r"\(.*?\)", "", name)        # 괄호군 제거
-    name = name.replace(" ", "")
-    name = name.replace("개인정보 보호법", "개인정보보호법")  # 흔한 표기 정규화 예시
+    name = re.sub(r"[（(].*?[）)]", "", name)   # 괄호 내용 제거: () / （）
+    name = re.sub(r"\s+", "", name)            # 모든 공백 제거
+
+    if "신용정보업감독규정" in name:
+        return "신용정보업감독규정"
+    if "전자금융감독규정" in name:
+        return "전자금융감독규정"
+    if "전자금융거래법" in name:
+        return "전자금융거래법"
+    if "전자서명법" in name:
+        return "전자서명법"
+    if "신용정보의이용및보호에관한법률" in name or "신용정보법" in name:
+        return "신용정보법"
+    if ("정보통신망이용촉진및정보보호등에관한법률" in name
+        or "정보통신망법" in name or "정보통신방법" in name):
+        return "정보통신방법"  # 원한 표기대로
+    if "개인정보보호법" in name or ("개인정보" in name and "보호법" in name):
+        return "개인정보보호법"
+
     return name
 
 def _parse_label_to_meta(label: str):
@@ -234,6 +250,12 @@ class RAGIndexer:
         collection.add(ids=ids, documents=list(all_chunks), embeddings=vectors.tolist(), metadatas=metas)
 
         print(f"✅ 저장 완료 | 총 청크 {total}개") 
+
+
+
+# -----------------------------
+# 검색기
+# -----------------------------
 
 
 # === 상단 공용 ===
@@ -494,7 +516,42 @@ def search_two_indexes_global_only(
     candidates = fuse_rrf_global_only([cand_gA, cand_gB], keep_for_ce=keep_for_ce)
     final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
     return final  # [{"idx","text","source","retriever","ce_score",...}, ...]
-    
+
+
+
+
+import unicodedata
+
+_KO_STOP = {"그리고","또는","또한","그러나","하지만","이는","이것","그것","등","및","에서","으로","에게",
+            "에","의","를","을","가","이"}
+
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).strip()
+
+def _simple_tokens(s: str, minlen: int = 2) -> set[str]:
+    s = _norm(s)
+    s = re.sub(r"[^0-9A-Za-z가-힣]+", " ", s)
+    toks = {t for t in s.split() if len(t) >= minlen and t not in _KO_STOP}
+    return toks
+
+def overlap_ratio_question_contexts(question: str, contexts: List[str]) -> float:
+    """
+    질문 토큰 중 컨텍스트에 '등장하는 비율'의 최대값: max_i |Q∩C_i| / |Q|
+    """
+    tq = _simple_tokens(question)
+    if not tq or not contexts:
+        return 0.0
+    best = 0.0
+    for c in contexts:
+        tc = _simple_tokens(c)
+        if not tc:
+            continue
+        r = len(tq & tc) / max(1, len(tq))
+        if r > best:
+            best = r
+    return best
+
+
 def answer_with_rag(
     question: str,
     retrieverA: RAGRetriever,                # ★ 바뀜: A 인덱스
@@ -534,7 +591,10 @@ def answer_with_rag(
 
         # 멀티 인덱스이므로 contexts는 passages 자체를 씀
         contexts = passages if use_context else []
-        top_meta_for_debug = [{"retriever": c["retriever"], "source": c.get("source","unknown"), "score": c["ce_score"]} for c in final[:top_k]]
+        top_meta_for_debug = [
+            {"retriever": c["retriever"], "source": c.get("source","unknown"), "score": c["ce_score"]} 
+            for c in final[:top_k]
+        ]
 
     else:
         # --- 주관식 처리: 두 인덱스 전역 검색만 수행 후 rerank ---
@@ -560,34 +620,40 @@ def answer_with_rag(
             {"retriever": c["retriever"], "source": c.get("source", "unknown"), "score": c["ce_score"]}
             for c in final[:top_k]
         ]
+    
+    # --- ★ 추가: 질문-컨텍스트 겹침률 계산 ---
+    overlap = overlap_ratio_question_contexts(question, contexts)
+    # 필요하면 디버깅 메타에 기록
+    if top_meta_for_debug:
+        top_meta_for_debug[0]["overlap_ratio"] = float(overlap)
 
-    # --- 2) 프롬프트 ---
-    prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
-
-    # --- 3) 1차 생성 ---
-    try:
-        if is_mc:
-            out = pipe(prompt, max_new_tokens=20, do_sample=False)
-        else:
-            out = pipe(prompt, max_new_tokens=256, do_sample=False)
+    q, opts = extract_question_and_choices(question)
+    is_neg = is_negated_question(q)
+    
+    if contexts and overlap >= OVERLAP_TAU and not is_neg and is_mc:
+        prompt = make_prompt_recheck(question, contexts=contexts)
+        # recheck는 항상 결정적(샘플링 X), 짧게
+        max_tokens = (40 if is_mc else 256)
+        out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
+        gen = out[0]["generated_text"].strip()
+        top_meta_for_debug[0]["recheck"] = True
+    else:
+        prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
+        max_tokens = (2 if is_mc else 256)
+        out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"]
-    except Exception:
-        out = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95)
-        gen = out[0]["generated_text"]
-
+    
     # --- 4) 추출 실패 시 샘플링 백업 ---
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
     if ans in ("0", "미응답"):
-        if is_mc:
-            outs = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95,
-                        num_return_sequences=3, repetition_penalty=1.05)
-        else:
-            outs = pipe(prompt, max_new_tokens=256, do_sample=True, temperature=0.6, top_p=0.95,
-                        num_return_sequences=3, repetition_penalty=1.05)
+        max_tokens = (2 if is_mc else 256)
+        outs = pipe(prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,
+                    num_return_sequences=3, repetition_penalty=1.05)
         for o in outs:
             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
             if cand not in ("0", "미응답"):
                 gen = o["generated_text"]
+                ans = cand
                 break
 
     # --- 5) 객관식 후처리 ---
@@ -596,6 +662,7 @@ def answer_with_rag(
         if not m:
             out = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
-
+            ans = extract_answer_only(gen, original_question=question, prompt=prompt)
+    
     # 멀티 인덱스 디버깅 정보를 되돌려 주면 cmd_run에서 소스 로깅이 쉬워짐
     return prompt, gen, passages, hits, use_context, contexts, top_meta_for_debug

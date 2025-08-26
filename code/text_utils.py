@@ -8,26 +8,29 @@ import contextlib
 
 from config import CHUNK_SIZE, CHUNK_OVERLAP
 
+# -----------------------------
+# 파일 불러오기
+# -----------------------------
 
 def _ensure_dir(d: str):
     if not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
-# def load_pdf_text(pdf_path: str) -> str:
-#     try:
-#         with pdfplumber.open(pdf_path) as pdf:
-#             return "\n".join(p.extract_text() or "" for p in pdf.pages)
-#     except Exception:
-#         # 1) 임시 수리본 저장
-#         tmp = pdf_path + ".fixed"
-#         with pikepdf.open(pdf_path, allow_overwriting_input=True) as doc:
-#             doc.save(tmp, linearize=True)
-#         # 2) 원본을 수리본으로 원자적 교체 → 이후 모든 단계가 같은 경로(원래 경로)를 사용
-#         os.replace(tmp, pdf_path)
+def load_pdf_text_law(pdf_path: str) -> str:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except Exception:
+        # 1) 임시 수리본 저장
+        tmp = pdf_path + ".fixed"
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as doc:
+            doc.save(tmp, linearize=True)
+        # 2) 원본을 수리본으로 원자적 교체 → 이후 모든 단계가 같은 경로(원래 경로)를 사용
+        os.replace(tmp, pdf_path)
 
-#         # 3) 다시 열기
-#         with pdfplumber.open(pdf_path) as pdf:
-#             return "\n".join(p.extract_text() or "" for p in pdf.pages)
+        # 3) 다시 열기
+        with pdfplumber.open(pdf_path) as pdf:
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
 
 
 def load_pdf_text(pdf_path: str) -> str:
@@ -108,6 +111,53 @@ def load_pdf_text(pdf_path: str) -> str:
     )
 
 
+# -----------------------------
+# 법령 텍스트 전처리
+# -----------------------------
+
+def _clean_text_law(t: str) -> str:
+    # 기본 정리
+    t = t.replace("\u3000", " ").strip()
+    t = re.sub(r"[ \t]+", " ", t)
+
+    # --- "삭제<날짜>"가 포함된 '모든 줄' 제거 ---
+    # 예: "1. 삭제<2020. 2. 4.>", "제28조의6 삭제 <2023. 3. 14.>", "…삭제＜2021.1.1.＞…"
+    # - (?m): 줄 단위 매칭
+    # - .*삭제\s*[<＜][^>＞]+[>＞].*$ : 해당 줄에 '삭제<...>' 또는 '삭제＜...＞' 패턴이 있으면 그 줄 전체 삭제
+    t = re.sub(r'(?m)^.*삭제\s*[<＜][^>＞]+[>＞].*$', '', t)
+
+    # 연속 빈 줄 정리 (앞에서 줄을 지웠으니 마지막에 수행)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t
+
+def _chunk_text_law(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
+    text = _clean_text_law(text)
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunk = text[start:end]
+        # 문장 경계 맞추기(가볍게): 마지막 마침표/줄바꿈 기준으로 자르기
+        if end < len(text):
+            cut = max(chunk.rfind("\n"), chunk.rfind("."), chunk.rfind("다."), chunk.rfind("다\n"))
+            if cut > int(chunk_size * 0.6):
+                chunk = chunk[:cut+1]
+                end = start + len(chunk)
+        chunks.append(chunk.strip())
+        start = max(end - overlap, end)
+    # 중복/빈 제거
+    uniq = []
+    seen = set()
+    for c in chunks:
+        if c and c not in seen:
+            uniq.append(c)
+            seen.add(c)
+    return uniq
+
+# -----------------------------
+# 법령 텍스트 전처리
+# -----------------------------
+
 BULLET_MAP = {
     "": "•",     # 윙딩스 점
     "▶": "•",
@@ -157,20 +207,28 @@ def _drop_lonely_pagenums(t: str) -> str:
     return re.sub(r'(?m)^\s*\d{1,4}\s*$', '', t)
 
 def _glue_bullet_paragraphs(t: str) -> str:
+    header_re = re.compile(r'(?<!\S)제\s*\d+\s*조(?:\s*의\s*\d+)?')  # 줄 중간도 탐지
     out, buf = [], []
     for line in t.splitlines():
-        if line.strip().startswith("• "):
-            if buf: out.append(" ".join(buf)); buf=[]
-            out.append(line.strip())
-        elif not line.strip():
+        ls = line.strip()
+        if not ls:
             if buf: out.append(" ".join(buf)); buf=[]
             out.append("")
-        else:
-            buf.append(line.strip())
+            continue
+        if ls.startswith("• "):
+            if buf: out.append(" ".join(buf)); buf=[]
+            out.append(ls)
+            continue
+        if header_re.search(ls):               # ← 헤더 만나면 절대 붙이지 않음
+            if buf: out.append(" ".join(buf)); buf=[]
+            out.append(ls)
+            continue
+        buf.append(ls)
     if buf: out.append(" ".join(buf))
     return "\n".join(out)
 
-def _clean_text(t: str) -> str:
+
+def _clean_text_generic(t: str) -> str:
     t = t.replace("\u3000", " ")  # 전각 공백
     t = t.replace("\r\n","\n").replace("\r","\n")
     t = re.sub(r"[ \t]+", " ", t)
@@ -192,10 +250,8 @@ def _clean_text(t: str) -> str:
     return t
 
 
-
-
-def _chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
-    text = _clean_text(text)
+def _chunk_text_generic(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
+    text = _clean_text_generic(text)
     chunks = []
     start = 0
     while start < len(text):
@@ -221,31 +277,24 @@ def _chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List
 
 # --- 조 헤더 정규식: '제n조(…)' 또는 '제n조의m(…)' + 줄 시작 + 괄호 존재 보장 + '조제' 참조 제외 ---
 # 전각 괄호(（ ）)까지 허용
+# 기존: r'(?m)^'
 ARTICLE_RE_STRICT = re.compile(
-    r'(?m)^'                                  # 줄 시작
-    r'(?P<header>' 
-       r'제\s*\d+\s*조'                        # 제n조
-       r'(?!\s*제)'                            # '조제…항' 참조는 제외
-       r'(?:\s*의\s*\d+)?'                     # '의m' (제n조의m) 허용
-    r')'
-    r'(?=\s*[（(])'                            # 바로 괄호가 존재해야 함(lookahead)
-    r'\s*[（(]'                                # 괄호 여는 기호 소모
-    r'(?P<title>[^）)]*)'                      # 제목(비워둘 수도 있음)
-    r'[）)]',                                  # 괄호 닫기
+    r'(?m)^\s*'                                # ← 앞 공백 허용
+    r'(?P<header>제\s*\d+\s*조(?!\s*제)(?:\s*의\s*\d+)?)'
+    r'\s*[（(](?P<title>[^）)]*)[）)]',
     re.UNICODE
 )
 
-# 폴백: 혹시 일부 문서에서 괄호가 누락된 헤더가 존재하는 경우 대비
 ARTICLE_RE_FALLBACK = re.compile(
-    r'(?m)^'
+    r'(?m)^\s*'                                # ← 앞 공백 허용
     r'(?P<header>제\s*\d+\s*조(?!\s*제)(?:\s*의\s*\d+)?)'
-    r'(?:\s*[（(](?P<title>[^）)]*)[）)])?',    # 괄호가 없어도 허용
+    r'(?:\s*[（(](?P<title>[^）)]*)[）)])?',
     re.UNICODE
 )
 
 
 def parse_korean_law_articles(raw_text: str):
-    text = _clean_text(raw_text)
+    text = _clean_text_law(raw_text)
 
     # 헤더가 줄 맨 앞에 떨어지도록 약간 정규화 (PDF 추출 잡음 완화)
     # '제176조제3항' 같은 붙은 참조는 띄어쓰기 보정
@@ -337,7 +386,7 @@ def split_article_if_long(article_text: str, max_len: int = CHUNK_SIZE, overlap:
 def chunk_law_text(raw_text: str, by_article: bool = True,
                    chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     if not by_article:
-        return _chunk_text(raw_text, chunk_size, overlap)
+        return _chunk_text_law(raw_text, chunk_size, overlap)
 
     articles = parse_korean_law_articles(raw_text)
     chunks = []
@@ -352,6 +401,6 @@ def chunk_law_text(raw_text: str, by_article: bool = True,
 
 
 def _chunk_generic(raw_text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    chunks = _chunk_text(raw_text, chunk_size, overlap)
+    chunks = _chunk_text_generic(raw_text, chunk_size, overlap)
     labels = [f"chunk#{i+1}" for i in range(len(chunks))]
     return chunks, labels

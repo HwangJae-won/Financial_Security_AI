@@ -1,6 +1,5 @@
 """
     # 1) 인덱스 빌드
-    !python code/main.py build --pdf "data/전자금융거래법(법률)(제19734호)(20240915).pdf"
     !python code/main.py build --dir "laws/" --kind "law"
     !python code/main.py build --dir "supplement/" --kind "generic"
     
@@ -11,13 +10,17 @@
     !python code/main.py ask --question $'전자금융거래법 제44조에 따르면, 청문 절차가 필요한 경우는 무엇인가?\n1 전자금융거래의 중단\n2 전자금융거래의 보안 점검\n3 전자금융업자의 등록 취소\n4 전자금융거래의 수수료 변경'
     !python code/main.py ask --question $'국내대리인이 법을 위반한 경우, 그 책임은 누구에게 있는가?\n1 국내대리인\n2 정부기관\n3 법원\n4 정보통신서비스 제공자\n5 개인정보 처리 위탁업체'
     !python code/main.py ask --question $'개인정보보호법 제63조에 따르면, 보호위원회가 자료제출 요구 및 검사를 통해 수집한 서류나 자료를 제3자에게 제공하거나 일반에 공개할 수 있는 경우는?\n1 자료가 비밀이 아닌 경우\n2 개인정보처리자의 동의가 있는 경우\n3 정보주체가 개인정보 열람을 요청한 경우\n4 법에 따른 경우\n5 보호위원회의 내부 규정에 따른 경우'
+    
+    !python code/main.py ask --question $'다음 중 금융회사 또는 전자금융업자가 책임을 일부 또는 전부 이용자에게 부담시킬 수 있는 경우는?\n1 금융회사의 내부 규정 위반으로 인한 사고\n2 이용자의 중대한 과실로 인한 사고\n3 접근매체의 위조로 인한 사고\n4 전자금융거래와 무관한 사고\n5 전자금융거래 시스템의 일시적인 장애로 인한 사고'
+    !python code/main.py ask --question $'본인확인기관이 본인확인업무를 폐지하고자 할 때, 방송통신위원회에 신고해야 하는 최소 기간은 며칠인가?\n1 45일\n2 90일\n3 30일\n4 60일\n5 15일'
 
+    !python code/main.py ask --question $'네트워크 공유의 동작 원리와 관련된 프로토콜이 아닌 것은?\n1 Netbios\n2 HTTPS\n3 SMTP\n4 Netbeui\n5 P2P'
+    !python code/main.py ask --question $'다음 중 여신전문금융업의 건전한 발전을 도모하기 위해 설립된 기관은 무엇인가?\n1 서민금융진흥원\n2 한국투자공사\n3 여신금융협회\n4 한국자산관리공사\n5 금융정보분석원'
+    
     # 3) test.csv 한 번에 추론(컬럼명: Question)
     !python code/main.py run --csv "data/test.csv"
 
 """
-
-
 
 
 import os
@@ -121,6 +124,13 @@ def cmd_ask(args):
     # 6) 참고 컨텍스트/소스 출력
     if use_context:
         print("\n===== 참고된 청크 (점수순) =====")
+        # ▶ 겹침률(overlap_ratio) 출력 (있을 때만)
+        if meta_dbg and isinstance(meta_dbg, list) and len(meta_dbg) > 0:
+            ov = meta_dbg[0].get("overlap_ratio", None)
+            recheck = meta_dbg[0].get("recheck", None)
+            if ov is not None:
+                print(f"(질문-컨텍스트 겹침률 overlap_ratio={ov:.3f}) | Recheck 여부={recheck}")
+        
         if meta_dbg is not None:
             # 멀티 인덱스 경로: meta_dbg에 retriever(A/B), source, score 포함
             for i, (md, p) in enumerate(zip(meta_dbg[:3], passages[:top_k]), start=1):
@@ -160,6 +170,7 @@ def cmd_run(args):
 
     preds, context_flags, full_context = [], [], []
     generated_texts, top_sources, top_scores = [], [], []
+    recheck_score = []
 
     top_k = getattr(args, "top_k", TOP_K)
     score_threshold = getattr(args, "threshold", SCORE_THRESHOLD)
@@ -195,7 +206,8 @@ def cmd_run(args):
         context_flags.append(bool(use_context))
         full_context.append(contexts)
         generated_texts.append(gen)
-
+        recheck_score.append(meta_dbg[0].get("overlap_ratio", None))
+        
         # (옵션) 디버깅용 메타 저장
         if meta_dbg is not None:
             # 멀티 인덱스 경로: answer_with_rag에서 이미 source와 점수를 제공
@@ -228,6 +240,7 @@ def cmd_run(args):
     result_with_info["Generated"] = generated_texts
     result_with_info["TopSources"] = top_sources
     result_with_info["TopScores"] = top_scores
+    result_with_info["RecheckScores"] = recheck_score
 
     result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
