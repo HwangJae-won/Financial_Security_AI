@@ -224,7 +224,7 @@ def cmd_run(args):
                 top_scores.append([])
 
     # 4) 제출 파일 저장
-    experiment_name = "sub_prompt.csv"
+    experiment_name = "result.csv"
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv("data/sample_submission.csv")
     sample_submission['Answer'] = preds
@@ -242,7 +242,7 @@ def cmd_run(args):
     result_with_info["TopScores"] = top_scores
     result_with_info["RecheckScores"] = recheck_score
 
-    result_with_info_path = os.path.join(OUTPUT_PATH, "sub_prompt_with_info.csv")
+    result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
 
