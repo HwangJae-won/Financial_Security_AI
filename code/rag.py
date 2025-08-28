@@ -222,6 +222,7 @@ class RAGIndexer:
 
         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
         vectors = self.embedder.encode_passages(all_chunks)  # (N, dim) float32
+        
         if vectors.shape[0] != len(all_chunks):
             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
         dim = vectors.shape[1]
@@ -232,6 +233,14 @@ class RAGIndexer:
         chroma_dir.mkdir(parents=True, exist_ok=True)
         client = PersistentClient(path=str(chroma_dir))
 
+
+        np.save(chroma_dir / "embeddings.npy", vectors)                 # (N, dim) float32
+        with open(chroma_dir / "ids.json", "w", encoding="utf-8") as f:
+            json.dump([f"doc-{i}" for i in range(len(all_chunks))], f, ensure_ascii=False)
+        with open(chroma_dir / "metas.json", "w", encoding="utf-8") as f:
+            json.dump(metas, f, ensure_ascii=False)
+
+        
         # 중복 빌드를 피하려면 기존 컬렉션 삭제 후 재생성(선택)
         try:
             client.delete_collection(CHROMA_COLLECTION)
@@ -347,7 +356,57 @@ class RAGRetriever:
             self._id2idx = {id_: i for i, id_ in enumerate(self.doc_ids)}
             self._n_index = n
             self._n_meta = n
+        
 
+
+        
+        # RAGRetriever.__init__ 끝부분에 추가:
+        
+        # ★ 결정적 검색을 위한 임베딩/메타 로드
+        self._emb = None
+        try:
+            emb_path = Path(chroma_dir) / "embeddings.npy"
+            ids_path = Path(chroma_dir) / "ids.json"
+            metas_path = Path(chroma_dir) / "metas.json"
+        
+            if emb_path.exists() and ids_path.exists():
+                emb = np.load(emb_path)                           # (N, dim)
+                with open(ids_path, "r", encoding="utf-8") as f:
+                    saved_ids = json.load(f)                      # ["doc-0", ...]
+                # 현재 컬렉션 id 순서(self.doc_ids)와 저장 순서가 다를 수 있으니 재정렬
+                pos = {id_: i for i, id_ in enumerate(saved_ids)}
+                order = [pos[id_] for id_ in self.doc_ids]        # KeyError 나면 불일치
+                self._emb = emb[order, :]
+            if metas_path.exists():
+                with open(metas_path, "r", encoding="utf-8") as f:
+                    self._metas = json.load(f)                   # 인덱싱 때의 메타
+            else:
+                self._metas = got.get("metadatas", [])           # Chroma에서 가져온 것
+        except Exception as e:
+            print(f"⚠️ exact embedding load skipped: {e}")
+    def _exact_topk(self, q_emb: np.ndarray, n: int, mask: list[int] | None = None):
+        """
+        L2-normalized 코사인(sim = dot)으로 완전탐색 Top-k. 결정적.
+        mask가 있으면 해당 인덱스들만 대상으로 검색.
+        """
+        assert self._emb is not None, "embeddings.npy 가 필요합니다 (index 단계에서 저장)."
+        if mask is None:
+            M = self._emb
+            base_indices = range(self._emb.shape[0])
+        else:
+            M = self._emb[mask, :]
+            base_indices = mask
+    
+        # q_emb도 정규화 (안전)
+        q = q_emb / (np.linalg.norm(q_emb) + 1e-12)
+        sims = M @ q  # (K,)
+        k = min(n, sims.shape[0])
+        top = np.argpartition(-sims, k - 1)[:k]
+        top = top[np.argsort(-sims[top], kind="mergesort")]  # ★ 안정 정렬
+        out = [(base_indices[i], float(sims[i])) for i in top]
+        return out
+
+    
     def _to_hits(self, res):
         """
         Chroma query/get 응답을 (idx, similarity) 리스트로 변환
@@ -384,53 +443,67 @@ class RAGRetriever:
         return out
 
     def global_search(self, query: str, n: int, retriever_tag: str) -> List[Dict]:
+        USE_EXACT = True  # ★ 결정적 검색 활성화
         if self._n_index <= 0:
             return []
-        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
-        res = self.collection.query(
-            query_embeddings=q_emb,
-            n_results=min(int(n), self._n_index),
-            include=["distances"],
-        )
+        q_emb = self.embedder.encode_queries([query])[0]  # (dim,)
+        if USE_EXACT and self._emb is not None:
+            hits = self._exact_topk(q_emb, n)
+            # hits: [(idx, sim)]
+            return self._hits_to_dicts(hits, retriever_tag)
+        # (폴백) 기존 HNSW
+        q = self.embedder.encode_queries([query]).astype("float32").tolist()
+        res = self.collection.query(query_embeddings=q, n_results=min(int(n), self._n_index), include=["distances"])
         hits = self._to_hits(res)
         return self._hits_to_dicts(hits, retriever_tag)
 
     def filtered_search(self, query: str, n: int, retriever_tag: str, use_clause: bool = True) -> List[Dict]:
+        USE_EXACT = True  # ★ 결정적 검색 활성화
         if self._n_index <= 0:
             return []
-        law, a_num, a_bis, clause, _article_key = _extract_explicit_law_and_article(query)
+        law, a_num, a_bis, clause, _ = _extract_explicit_law_and_article(query)
         if not (law and (a_num is not None)):
-            return []  # 명시적 법/조문 없으면 필터 검색 생략
-
-        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
-
-        where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
-        hits_filtered = []
-
-        if use_clause and (clause is not None):
-            where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
-            res_f1 = self.collection.query(
-                query_embeddings=q_emb, n_results=min(int(n), self._n_index),
-                where=where_clause, include=["distances"]
-            )
-            hits_filtered = self._to_hits(res_f1)
-            if len(hits_filtered) < min(int(n), self._n_index):
-                res_f2 = self.collection.query(
-                    query_embeddings=q_emb, n_results=min(int(n), self._n_index),
-                    where=where, include=["distances"]
-                )
-                add = self._to_hits(res_f2)
-                # idx 기준 dedup
-                seen = {i for i, _ in hits_filtered}
-                hits_filtered += [h for h in add if h[0] not in seen]
-        else:
-            res_f = self.collection.query(
-                query_embeddings=q_emb, n_results=min(int(n), self._n_index),
-                where=where, include=["distances"]
-            )
-            hits_filtered = self._to_hits(res_f)
-
-        return self._hits_to_dicts(hits_filtered, retriever_tag)
+            return []
+    
+        # ★ 메타에서 mask 구성 (결정적)
+        mask = []
+        metas = getattr(self, "_metas", [])
+        for i, m in enumerate(metas):
+            if not m: 
+                continue
+            if m.get("law") != law: 
+                continue
+            if m.get("article_num") != a_num: 
+                continue
+            if m.get("article_bis") != a_bis: 
+                continue
+            if use_clause and (clause is not None):
+                if m.get("clause") != clause:
+                    continue
+            mask.append(i)
+    
+        # 항 단위가 없거나 mask가 비면 조 단위 폴백
+        if not mask and (clause is not None) and use_clause:
+            for i, m in enumerate(metas):
+                if not m: 
+                    continue
+                if m.get("law") == law and m.get("article_num") == a_num and m.get("article_bis") == a_bis:
+                    mask.append(i)
+    
+        if not mask:
+            return []
+    
+        q_emb = self.embedder.encode_queries([query])[0]
+        if USE_EXACT and self._emb is not None:
+            hits = self._exact_topk(q_emb, n, mask=mask)
+            return self._hits_to_dicts(hits, retriever_tag)
+    
+        # (폴백) 기존 HNSW where
+        q = self.embedder.encode_queries([query]).astype("float32").tolist()
+        where = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=(clause if use_clause else None))
+        res = self.collection.query(query_embeddings=q, n_results=min(int(n), self._n_index), where=where, include=["distances"])
+        hits = self._to_hits(res)
+        return self._hits_to_dicts(hits, retriever_tag)
         
     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.chunks[i] for i, _ in hits]
@@ -482,6 +555,51 @@ def rerank_and_pick(query: str, candidates: List[Dict], reranker, topn: int = 1,
         c["ce_score"] = float(s)
     return sorted(candidates, key=lambda x: x["ce_score"], reverse=True)[:topn]
 
+
+
+
+
+# 질문-후보 겹침으로 약한 후보 제거/재정렬
+OVERLAP_TAU_RETR = 0.08  # 필요하면 0.05~0.08 사이 미세조정
+
+def _filter_by_overlap(question: str, cands: List[Dict], tau: float = OVERLAP_TAU_RETR) -> List[Dict]:
+    if not cands:
+        return cands
+    scored = []
+    for c in cands:
+        r = overlap_ratio_question_contexts(question, [c["text"]])
+        c = dict(c)
+        c["_overlap"] = float(r)
+        scored.append(c)
+    kept = [c for c in scored if c["_overlap"] >= tau]
+    if not kept:  # 전부 낮으면 드롭하지 말고 원본 유지
+        return cands
+    # 겹침↓ 흔들림 방지: overlap → rrf → source → idx
+    kept.sort(key=lambda x: (-x["_overlap"], -x.get("rrf", 0.0), x.get("source",""), x.get("idx", 1<<30)))
+    return kept
+
+# 임베딩으로 정확 재점수(코사인) → 안정 정렬
+def _rescore_by_embedding(query: str, cands: List[Dict], embedder: E5Embedder) -> List[Dict]:
+    if not cands:
+        return cands
+    qv = embedder.encode_queries([query])[0]
+    pv = embedder.encode_passages([c["text"] for c in cands])
+    # 정규화(encode가 L2 norm이면 중복이지만 안전하게 한 번 더)
+    qv = qv / (np.linalg.norm(qv) + 1e-12)
+    norms = np.linalg.norm(pv, axis=1, keepdims=True) + 1e-12
+    pv = pv / norms
+    sims = (pv @ qv).tolist()
+    out = []
+    for c, s in zip(cands, sims):
+        cc = dict(c)
+        cc["emb_sim"] = float(s)
+        out.append(cc)
+    # emb_sim → rrf → source → idx (안정 타이브레이크)
+    out.sort(key=lambda x: (-x["emb_sim"], -x.get("rrf", 0.0), x.get("source",""), x.get("idx", 1<<30)))
+    return out
+
+
+
 def search_two_indexes_pipeline(
     query: str,
     retrA, retrB,          # RAGRetriever
@@ -496,6 +614,8 @@ def search_two_indexes_pipeline(
 
     # 융합 → rerank
     candidates = fuse_rrf([cand_fA, cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+    candidates = _filter_by_overlap(query, candidates, tau=OVERLAP_TAU_RETR)                  # ★ 추가
+    candidates = _rescore_by_embedding(query, candidates, embedder=retrA.embedder)            # ★ 추가
     final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
     return final            # Dict 리스트 (각 원소에 text/source/retriever/idx/ce_score 포함)
 
@@ -514,6 +634,8 @@ def search_two_indexes_global_only(
 
     # 2) 융합(RRF) → 3) CE rerank
     candidates = fuse_rrf_global_only([cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+    candidates = _filter_by_overlap(query, candidates, tau=OVERLAP_TAU_RETR)                  # ★ 추가
+    candidates = _rescore_by_embedding(query, candidates, embedder=retrA.embedder)            # ★ 추가
     final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
     return final  # [{"idx","text","source","retriever","ce_score",...}, ...]
 
