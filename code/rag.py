@@ -755,20 +755,20 @@ def answer_with_rag(
     if contexts and overlap >= OVERLAP_TAU and not is_neg and is_mc:
         prompt = make_prompt_recheck(question, contexts=contexts)
         # recheck는 항상 결정적(샘플링 X), 짧게
-        max_tokens = (40 if is_mc else 256)
+        max_tokens = (40 if is_mc else 512)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"].strip()
         top_meta_for_debug[0]["recheck"] = True
     else:
         prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
-        max_tokens = (2 if is_mc else 256)
+        max_tokens = (2 if is_mc else 512)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"]
     
     # --- 4) 추출 실패 시 샘플링 백업 ---
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
     if ans in ("0", "미응답"):
-        max_tokens = (2 if is_mc else 256)
+        max_tokens = (2 if is_mc else 512)
         outs = pipe(prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,
                     num_return_sequences=3, repetition_penalty=1.05)
         for o in outs:
