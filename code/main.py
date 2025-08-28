@@ -24,6 +24,7 @@
 
 
 import os
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 import torch
 import pandas as pd
 import argparse
@@ -161,7 +162,7 @@ def cmd_run(args):
     retrB = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "supplement"), device="cpu")
 
     # 2) Reranker
-    rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
+    rr_model = getattr(args, "rerank_model", "Alibaba-NLP/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
     reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=800)
 

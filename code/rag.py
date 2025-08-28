@@ -78,48 +78,33 @@ class E5Embedder:
 # Reranker
 # -----------------------------
 class STReranker:
-    def __init__(self, model_name_or_path: str = "/dev/shm/models/gte-multilingual-reranker-base", 
+    """
+    Sentence-Transformers CrossEncoder 기반 재정렬기.
+    - 기본 모델: "Alibaba-NLP/gte-multilingual-reranker-base" (멀티링궐)
+    - 입력: (query, passages[list[str]])
+    - 출력: scores[list[float]] (클수록 관련성 높음)
+    """
+    def __init__(self, model_name_or_path: str = "Alibaba-NLP/gte-multilingual-reranker-base", 
                  device: str | None = None, max_length: int = 512, trust_remote_code=True):
-        # 로컬 경로/허브 모두 OK
+
+         # model_name_or_path에 로컬 디렉토리 or HF 모델명 모두 허용
         path = model_name_or_path
         if os.path.isdir(model_name_or_path):
+            # 로컬 디렉토리 우선 사용
             path = model_name_or_path
-
-        self.model = CrossEncoder(path, device=device, max_length=max_length, trust_remote_code=True)
-
-        # *** 중요: 출력 dtype 안정화를 위해 모델을 FP32로 이동 (가능할 때만) ***
-        try:
-            # sentence-transformers의 내부 모델 모듈 접근
-            self.model.model = self.model.model.to(dtype=torch.float32)
-        except Exception:
-            pass
+        print(model_name_or_path)  
+        self.model = CrossEncoder(model_name_or_path, device=device, max_length=max_length, trust_remote_code=True)
 
     @torch.no_grad()
     def score(self, query: str, passages: list[str], batch_size: int = 32) -> list[float]:
         if not passages:
             return []
+        # 너무 긴 본문이면 대략 자르기(토큰 기준 아님, 안전장치)
         trimmed = [p[:4000] for p in passages]
         pairs = [(query, p) for p in trimmed]
+        scores = self.model.predict(pairs, batch_size=batch_size, convert_to_numpy=True)
+        return scores.tolist()
 
-        # *** 핵심 수정: numpy 변환을 라이브러리에 맡기지 않고 우리가 처리 ***
-        scores = self.model.predict(
-            pairs, batch_size=batch_size, convert_to_numpy=False
-        )
-        # sentence-transformers가 torch.Tensor 또는 list[Tensor/float]를 줄 수 있음
-        if isinstance(scores, torch.Tensor):
-            t = scores.to(torch.float32).detach().cpu()
-            return t.numpy().astype("float32").tolist()
-        elif isinstance(scores, (list, tuple)):
-            out = []
-            for s in scores:
-                if torch.is_tensor(s):
-                    out.append(float(s.to(torch.float32).detach().cpu().item()))
-                else:
-                    out.append(float(s))  # 이미 파이썬 float
-            return out
-        else:
-            # 예외 형태 방어
-            return [float(scores)]
 
 
 # -----------------------------
@@ -236,6 +221,7 @@ class RAGIndexer:
 
         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
         vectors = self.embedder.encode_passages(all_chunks)  # (N, dim) float32
+        
         if vectors.shape[0] != len(all_chunks):
             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
         dim = vectors.shape[1]
@@ -246,6 +232,14 @@ class RAGIndexer:
         chroma_dir.mkdir(parents=True, exist_ok=True)
         client = PersistentClient(path=str(chroma_dir))
 
+
+        np.save(chroma_dir / "embeddings.npy", vectors)                 # (N, dim) float32
+        with open(chroma_dir / "ids.json", "w", encoding="utf-8") as f:
+            json.dump([f"doc-{i}" for i in range(len(all_chunks))], f, ensure_ascii=False)
+        with open(chroma_dir / "metas.json", "w", encoding="utf-8") as f:
+            json.dump(metas, f, ensure_ascii=False)
+
+        
         # 중복 빌드를 피하려면 기존 컬렉션 삭제 후 재생성(선택)
         try:
             client.delete_collection(CHROMA_COLLECTION)
@@ -264,7 +258,6 @@ class RAGIndexer:
         collection.add(ids=ids, documents=list(all_chunks), embeddings=vectors.tolist(), metadatas=metas)
 
         print(f"✅ 저장 완료 | 총 청크 {total}개") 
-
 
 
 # -----------------------------
@@ -361,7 +354,57 @@ class RAGRetriever:
             self._id2idx = {id_: i for i, id_ in enumerate(self.doc_ids)}
             self._n_index = n
             self._n_meta = n
+        
 
+
+        
+        # RAGRetriever.__init__ 끝부분에 추가:
+        
+        # ★ 결정적 검색을 위한 임베딩/메타 로드
+        self._emb = None
+        try:
+            emb_path = Path(chroma_dir) / "embeddings.npy"
+            ids_path = Path(chroma_dir) / "ids.json"
+            metas_path = Path(chroma_dir) / "metas.json"
+        
+            if emb_path.exists() and ids_path.exists():
+                emb = np.load(emb_path)                           # (N, dim)
+                with open(ids_path, "r", encoding="utf-8") as f:
+                    saved_ids = json.load(f)                      # ["doc-0", ...]
+                # 현재 컬렉션 id 순서(self.doc_ids)와 저장 순서가 다를 수 있으니 재정렬
+                pos = {id_: i for i, id_ in enumerate(saved_ids)}
+                order = [pos[id_] for id_ in self.doc_ids]        # KeyError 나면 불일치
+                self._emb = emb[order, :]
+            if metas_path.exists():
+                with open(metas_path, "r", encoding="utf-8") as f:
+                    self._metas = json.load(f)                   # 인덱싱 때의 메타
+            else:
+                self._metas = got.get("metadatas", [])           # Chroma에서 가져온 것
+        except Exception as e:
+            print(f"⚠️ exact embedding load skipped: {e}")
+    def _exact_topk(self, q_emb: np.ndarray, n: int, mask: list[int] | None = None):
+        """
+        L2-normalized 코사인(sim = dot)으로 완전탐색 Top-k. 결정적.
+        mask가 있으면 해당 인덱스들만 대상으로 검색.
+        """
+        assert self._emb is not None, "embeddings.npy 가 필요합니다 (index 단계에서 저장)."
+        if mask is None:
+            M = self._emb
+            base_indices = range(self._emb.shape[0])
+        else:
+            M = self._emb[mask, :]
+            base_indices = mask
+    
+        # q_emb도 정규화 (안전)
+        q = q_emb / (np.linalg.norm(q_emb) + 1e-12)
+        sims = M @ q  # (K,)
+        k = min(n, sims.shape[0])
+        top = np.argpartition(-sims, k - 1)[:k]
+        top = top[np.argsort(-sims[top], kind="mergesort")]  # ★ 안정 정렬
+        out = [(base_indices[i], float(sims[i])) for i in top]
+        return out
+
+    
     def _to_hits(self, res):
         """
         Chroma query/get 응답을 (idx, similarity) 리스트로 변환
@@ -398,59 +441,74 @@ class RAGRetriever:
         return out
 
     def global_search(self, query: str, n: int, retriever_tag: str) -> List[Dict]:
+        USE_EXACT = True  # ★ 결정적 검색 활성화
         if self._n_index <= 0:
             return []
-        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
-        res = self.collection.query(
-            query_embeddings=q_emb,
-            n_results=min(int(n), self._n_index),
-            include=["distances"],
-        )
+        q_emb = self.embedder.encode_queries([query])[0]  # (dim,)
+        if USE_EXACT and self._emb is not None:
+            hits = self._exact_topk(q_emb, n)
+            # hits: [(idx, sim)]
+            return self._hits_to_dicts(hits, retriever_tag)
+        # (폴백) 기존 HNSW
+        q = self.embedder.encode_queries([query]).astype("float32").tolist()
+        res = self.collection.query(query_embeddings=q, n_results=min(int(n), self._n_index), include=["distances"])
         hits = self._to_hits(res)
         return self._hits_to_dicts(hits, retriever_tag)
 
     def filtered_search(self, query: str, n: int, retriever_tag: str, use_clause: bool = True) -> List[Dict]:
+        USE_EXACT = True  # ★ 결정적 검색 활성화
         if self._n_index <= 0:
             return []
-        law, a_num, a_bis, clause, _article_key = _extract_explicit_law_and_article(query)
+        law, a_num, a_bis, clause, _ = _extract_explicit_law_and_article(query)
         if not (law and (a_num is not None)):
-            return []  # 명시적 법/조문 없으면 필터 검색 생략
-
-        q_emb = self.embedder.encode_queries([query]).astype("float32").tolist()
-
-        where = _where_all(law=law, article_num=a_num, article_bis=a_bis)
-        hits_filtered = []
-
-        if use_clause and (clause is not None):
-            where_clause = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=clause)
-            res_f1 = self.collection.query(
-                query_embeddings=q_emb, n_results=min(int(n), self._n_index),
-                where=where_clause, include=["distances"]
-            )
-            hits_filtered = self._to_hits(res_f1)
-            if len(hits_filtered) < min(int(n), self._n_index):
-                res_f2 = self.collection.query(
-                    query_embeddings=q_emb, n_results=min(int(n), self._n_index),
-                    where=where, include=["distances"]
-                )
-                add = self._to_hits(res_f2)
-                # idx 기준 dedup
-                seen = {i for i, _ in hits_filtered}
-                hits_filtered += [h for h in add if h[0] not in seen]
-        else:
-            res_f = self.collection.query(
-                query_embeddings=q_emb, n_results=min(int(n), self._n_index),
-                where=where, include=["distances"]
-            )
-            hits_filtered = self._to_hits(res_f)
-
-        return self._hits_to_dicts(hits_filtered, retriever_tag)
+            return []
+    
+        # ★ 메타에서 mask 구성 (결정적)
+        mask = []
+        metas = getattr(self, "_metas", [])
+        for i, m in enumerate(metas):
+            if not m: 
+                continue
+            if m.get("law") != law: 
+                continue
+            if m.get("article_num") != a_num: 
+                continue
+            if m.get("article_bis") != a_bis: 
+                continue
+            if use_clause and (clause is not None):
+                if m.get("clause") != clause:
+                    continue
+            mask.append(i)
+    
+        # 항 단위가 없거나 mask가 비면 조 단위 폴백
+        if not mask and (clause is not None) and use_clause:
+            for i, m in enumerate(metas):
+                if not m: 
+                    continue
+                if m.get("law") == law and m.get("article_num") == a_num and m.get("article_bis") == a_bis:
+                    mask.append(i)
+    
+        if not mask:
+            return []
+    
+        q_emb = self.embedder.encode_queries([query])[0]
+        if USE_EXACT and self._emb is not None:
+            hits = self._exact_topk(q_emb, n, mask=mask)
+            return self._hits_to_dicts(hits, retriever_tag)
+    
+        # (폴백) 기존 HNSW where
+        q = self.embedder.encode_queries([query]).astype("float32").tolist()
+        where = _where_all(law=law, article_num=a_num, article_bis=a_bis, clause=(clause if use_clause else None))
+        res = self.collection.query(query_embeddings=q, n_results=min(int(n), self._n_index), where=where, include=["distances"])
+        hits = self._to_hits(res)
+        return self._hits_to_dicts(hits, retriever_tag)
         
     def get_passages(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.chunks[i] for i, _ in hits]
 
     def get_sources(self, hits: List[Tuple[int, float]]) -> List[str]:
         return [self.sources[i] for i, _ in hits]
+
 
 
 # -----------------------------
@@ -496,6 +554,51 @@ def rerank_and_pick(query: str, candidates: List[Dict], reranker, topn: int = 1,
         c["ce_score"] = float(s)
     return sorted(candidates, key=lambda x: x["ce_score"], reverse=True)[:topn]
 
+
+
+
+
+# 질문-후보 겹침으로 약한 후보 제거/재정렬
+OVERLAP_TAU_RETR = 0.08  # 필요하면 0.05~0.08 사이 미세조정
+
+def _filter_by_overlap(question: str, cands: List[Dict], tau: float = OVERLAP_TAU_RETR) -> List[Dict]:
+    if not cands:
+        return cands
+    scored = []
+    for c in cands:
+        r = overlap_ratio_question_contexts(question, [c["text"]])
+        c = dict(c)
+        c["_overlap"] = float(r)
+        scored.append(c)
+    kept = [c for c in scored if c["_overlap"] >= tau]
+    if not kept:  # 전부 낮으면 드롭하지 말고 원본 유지
+        return cands
+    # 겹침↓ 흔들림 방지: overlap → rrf → source → idx
+    kept.sort(key=lambda x: (-x["_overlap"], -x.get("rrf", 0.0), x.get("source",""), x.get("idx", 1<<30)))
+    return kept
+
+# 임베딩으로 정확 재점수(코사인) → 안정 정렬
+def _rescore_by_embedding(query: str, cands: List[Dict], embedder: E5Embedder) -> List[Dict]:
+    if not cands:
+        return cands
+    qv = embedder.encode_queries([query])[0]
+    pv = embedder.encode_passages([c["text"] for c in cands])
+    # 정규화(encode가 L2 norm이면 중복이지만 안전하게 한 번 더)
+    qv = qv / (np.linalg.norm(qv) + 1e-12)
+    norms = np.linalg.norm(pv, axis=1, keepdims=True) + 1e-12
+    pv = pv / norms
+    sims = (pv @ qv).tolist()
+    out = []
+    for c, s in zip(cands, sims):
+        cc = dict(c)
+        cc["emb_sim"] = float(s)
+        out.append(cc)
+    # emb_sim → rrf → source → idx (안정 타이브레이크)
+    out.sort(key=lambda x: (-x["emb_sim"], -x.get("rrf", 0.0), x.get("source",""), x.get("idx", 1<<30)))
+    return out
+
+
+
 def search_two_indexes_pipeline(
     query: str,
     retrA, retrB,          # RAGRetriever
@@ -510,6 +613,8 @@ def search_two_indexes_pipeline(
 
     # 융합 → rerank
     candidates = fuse_rrf([cand_fA, cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+    candidates = _filter_by_overlap(query, candidates, tau=OVERLAP_TAU_RETR)                  # ★ 추가
+    candidates = _rescore_by_embedding(query, candidates, embedder=retrA.embedder)            # ★ 추가
     final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
     return final            # Dict 리스트 (각 원소에 text/source/retriever/idx/ce_score 포함)
 
@@ -528,6 +633,8 @@ def search_two_indexes_global_only(
 
     # 2) 융합(RRF) → 3) CE rerank
     candidates = fuse_rrf_global_only([cand_gA, cand_gB], keep_for_ce=keep_for_ce)
+    candidates = _filter_by_overlap(query, candidates, tau=OVERLAP_TAU_RETR)                  # ★ 추가
+    candidates = _rescore_by_embedding(query, candidates, embedder=retrA.embedder)            # ★ 추가
     final = rerank_and_pick(query, candidates, reranker=reranker, topn=topn, batch_size=32)
     return final  # [{"idx","text","source","retriever","ce_score",...}, ...]
 
@@ -547,107 +654,6 @@ def _simple_tokens(s: str, minlen: int = 2) -> set[str]:
     s = re.sub(r"[^0-9A-Za-z가-힣]+", " ", s)
     toks = {t for t in s.split() if len(t) >= minlen and t not in _KO_STOP}
     return toks
-# ==== Sentence-level evidence & simple validation ====
-
-# _SENT_SPLIT = re.compile(r'(?<=[\.!?]|다\.|요\.|니다\.)\s+')
-_SENTENCE_REGEX = re.compile(
-    r'.+?(?:다\.|요\.|니다\.|[.!?])(?=(?:\s+|$))',
-    re.S
-)
-def split_sentences_kor(text: str, min_len: int = 2) -> list[str]:
-    if not text or not text.strip():
-        return []
-    sents = [m.group(0).strip() for m in _SENTENCE_REGEX.finditer(text)]
-    # 문장 종결부호가 전혀 없을 때 폴백
-    if not sents:
-        only = text.strip()
-        return [only] if only else []
-    # 너무 짧은 토막 제거(선택)
-    return [s for s in sents if len(s) >= min_len]
-# def split_sentences_kor(text: str, max_len: int = 400) -> list[str]:
-#     if not text:
-#         return []
-#     # 1) 문장 단위 대충 자르되 너무 긴 문장은 잘라서 후보로
-#     sents = []
-#     for seg in _SENT_SPLIT.split(text.strip()):
-#         seg = seg.strip()
-#         if not seg:
-#             continue
-#         if len(seg) <= max_len:
-#             sents.append(seg)
-#         else:
-#             # 안전 가르기
-#             for i in range(0, len(seg), max_len):
-#                 sents.append(seg[i:i+max_len].strip())
-    # 중복 제거
-    uniq = []
-    seen = set()
-    for s in sents:
-        if s and s not in seen:
-            seen.add(s)
-            uniq.append(s)
-    return uniq
-
-def extract_evidence_sentences(query: str, passages: list[str], reranker: STReranker | None,
-                               per_passage: int = 1, max_total: int = 2) -> list[str]:
-    """각 passage에서 문장 후보를 뽑고 CrossEncoder로 점수화 → 상위 문장 반환."""
-    if not passages:
-        return []
-    # reranker 없으면 간단 토큰 겹침으로 고름
-    if reranker is None:
-        qtok = _simple_tokens(query)
-        scored = []
-        for p in passages:
-            for s in split_sentences_kor(p):
-                st = _simple_tokens(s)
-                score = len(qtok & st) / max(1, len(qtok))
-                if score > 0:
-                    scored.append((s, score))
-        return [s for s,_ in sorted(scored, key=lambda x: x[1], reverse=True)[:max_total]]
-
-    # CE로 스코어
-    pairs = []
-    sent_map = []
-    for pi, p in enumerate(passages):
-        sents = split_sentences_kor(p)
-        for s in sents:
-            pairs.append((query, s))
-            sent_map.append((pi, s))
-    if not pairs:
-        return []
-    scores = reranker.model.predict(pairs, batch_size=64, convert_to_numpy=True)
-    scored = [(sent_map[i][0], sent_map[i][1], float(scores[i])) for i in range(len(scores))]
-    # passage별 상위 문장 제한 + 전체 top 제한
-    by_pass = {}
-    for pi, s, sc in sorted(scored, key=lambda x: x[2], reverse=True):
-        if by_pass.get(pi, 0) >= per_passage:
-            continue
-        by_pass[pi] = by_pass.get(pi, 0) + 1
-        yield_item = (s, sc)
-        (yield_item)  # just to make intent clear
-    # 다시 전역 top으로 한 번 더 필터
-    merged = []
-    used = set()
-    for pi, s, sc in sorted(scored, key=lambda x: x[2], reverse=True):
-        if s in used:
-            continue
-        merged.append((s, sc))
-        used.add(s)
-        if len(merged) >= max_total:
-            break
-    return [s for s,_ in merged]
-
-def validate_answer_mc(generated: str) -> bool:
-    return bool(re.search(r"\b([0-9]{1,2})\b", generated))
-
-def validate_answer_gen(generated: str, min_len: int = 12) -> bool:
-    g = (generated or "").strip()
-    if len(g) < min_len:
-        return False
-    bad = ["모르겠습니다", "답변할 수 없습니다", "정보가 없습니다"]
-    if any(b in g for b in bad):
-        return False
-    return True
 
 def overlap_ratio_question_contexts(question: str, contexts: List[str]) -> float:
     """
@@ -666,20 +672,21 @@ def overlap_ratio_question_contexts(question: str, contexts: List[str]) -> float
             best = r
     return best
 
+
 def answer_with_rag(
     question: str,
-    retrieverA: RAGRetriever,                # A 인덱스 (laws)
-    retrieverB: RAGRetriever,                # B 인덱스 (supplement)
+    retrieverA: RAGRetriever,                # ★ 바뀜: A 인덱스
+    retrieverB: RAGRetriever,                # ★ 바뀜: B 인덱스
     pipe,
     top_k=TOP_K,
     score_threshold: float = SCORE_THRESHOLD,
     reranker: Optional["STReranker"] = None,
     rerank_threshold: float = RERANK_THRESHOLD,
-    M_generic: int = M_GENERIC,              # A 전역 후보
-    M_filtered: int = M_FILTERED,            # A 필터 후보
-    M_generic_B: int = None,                 # B 전역 후보 (기본 M_generic)
-    keep_for_ce: int = 50,                   # CE에 태울 최대 후보 수
-    use_clause: bool = True,                 # 항 단위까지 필터
+    M_generic: int = M_GENERIC,              # A의 전역 후보 (기존 의미 유지)
+    M_filtered: int = M_FILTERED,            # A의 필터 후보
+    M_generic_B: int = None,                 # ★ 추가: B 전역 후보 (기본 없으면 M_generic과 동일)
+    keep_for_ce: int = 50,                   # ★ 추가: CE에 태울 최대 후보 수
+    use_clause: bool = True,                 # ★ 추가: 항 단위까지 필터
 ):
     if M_generic_B is None:
         M_generic_B = M_generic
@@ -700,113 +707,69 @@ def answer_with_rag(
         top_score = final[0]["ce_score"] if final else float("-inf")
         use_context = (len(final) > 0) and (top_score >= rerank_threshold)
 
-        # 멀티 인덱스: hits는 ("A:idx"/"B:idx", ce_score) 형태
+        # 디버깅/호환용: hits는 (pseudo) 튜플로 만들어 두되, 인덱스 구분을 위해 문자열 키 사용
         hits = [(f'{c["retriever"]}:{c["idx"]}', c["ce_score"]) for c in final[:top_k]]
+
+        # 멀티 인덱스이므로 contexts는 passages 자체를 씀
         contexts = passages if use_context else []
         top_meta_for_debug = [
             {"retriever": c["retriever"], "source": c.get("source","unknown"), "score": c["ce_score"]} 
             for c in final[:top_k]
         ]
+
     else:
-        # --- 주관식: 두 인덱스 전역 검색 → CE rerank
+        # --- 주관식 처리: 두 인덱스 전역 검색만 수행 후 rerank ---
         final = search_two_indexes_global_only(
             query=question,
             retrA=retrieverA,
             retrB=retrieverB,
-            M_generic_A=M_generic,     # laws 전역 후보
-            M_generic_B=M_generic_B,   # supplement 전역 후보
+            M_generic_A=M_generic,     # laws 인덱스 전역 후보 수
+            M_generic_B=M_generic_B,   # supplement 인덱스 전역 후보 수
             reranker=reranker,
             keep_for_ce=keep_for_ce,
             topn=max(1, top_k),
         )
+
         passages = [c["text"] for c in final[:top_k]]
         top_score = final[0]["ce_score"] if final else float("-inf")
-        use_context = (len(final) > 0) and (top_score >= score_threshold)
+        use_context = (len(final) > 0) and (top_score >= score_threshold)  # 게이트는 score_threshold 재사용
 
+        # hits와 meta_dbg 준비
         hits = [(f'{c["retriever"]}:{c["idx"]}', c["ce_score"]) for c in final[:top_k]]
         contexts = passages if use_context else []
         top_meta_for_debug = [
             {"retriever": c["retriever"], "source": c.get("source", "unknown"), "score": c["ce_score"]}
             for c in final[:top_k]
         ]
-
-    # --- 2) (추가) 질문-컨텍스트 겹침률 기록 ---
+    
+    # --- ★ 추가: 질문-컨텍스트 겹침률 계산 ---
     overlap = overlap_ratio_question_contexts(question, contexts)
+    # 필요하면 디버깅 메타에 기록
     if top_meta_for_debug:
         top_meta_for_debug[0]["overlap_ratio"] = float(overlap)
 
-    # --- 3) (추가) 문장 단위 근거 추출 & 컨텍스트 증강 ---
-    ev_max = (1 if is_mc else 2)  # MC 1문장, 주관식 1~2문장
-    evidences = extract_evidence_sentences(
-        question, passages if use_context else [], reranker, per_passage=1, max_total=ev_max
-    )
-
-    if use_context and passages:
-        ctx_aug = []
-        for i, p in enumerate(passages[:top_k]):
-            ev = evidences[i] if i < len(evidences) else None
-            ctx_aug.append(f"[근거] {ev}\n[본문] {p}" if ev else p)
-    else:
-        ctx_aug = []
-
-    # --- 4) 프롬프트 & 1차 생성 ---
     q, opts = extract_question_and_choices(question)
     is_neg = is_negated_question(q)
-
-    if ctx_aug and overlap >= OVERLAP_TAU and not is_neg and is_mc:
-        # RECHECK 경로: 결정적으로 짧게
-        prompt = make_prompt_recheck(question, contexts=ctx_aug)
-        max_tokens = 40
+    
+    if contexts and overlap >= OVERLAP_TAU and not is_neg and is_mc:
+        prompt = make_prompt_recheck(question, contexts=contexts)
+        # recheck는 항상 결정적(샘플링 X), 짧게
+        max_tokens = (40 if is_mc else 512)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"].strip()
         top_meta_for_debug[0]["recheck"] = True
     else:
-        prompt = make_prompt_rag_exaone(question, ctx_aug, use_fewshot=True)
-        max_tokens = (2 if is_mc else 256)
+        prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
+        max_tokens = (2 if is_mc else 512)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"]
-
-    # --- 5) (추가) 간단 검증 ---
-    ok = validate_answer_mc(gen) if is_mc else validate_answer_gen(gen)
-    need_retry = (not ok) or (use_context and overlap < OVERLAP_TAU * 0.6)
-
-    # --- 6) (추가) 실패 시 1회 재검색·재생성 ---
-    if need_retry:
-        # 후보폭 확장: 전역 후보 수/keep_for_ce 2배(상한 있음)
-        final_retry = search_two_indexes_global_only(
-            query=question,
-            retrA=retrieverA, retrB=retrieverB,
-            M_generic_A=min(M_generic*2, 50),
-            M_generic_B=min(M_generic_B*2, 50),
-            reranker=reranker,
-            keep_for_ce=min(keep_for_ce*2, 100),
-            topn=max(1, top_k),
-        )
-        passages2 = [c["text"] for c in final_retry[:top_k]]
-        evidences2 = extract_evidence_sentences(
-            question, passages2, reranker, per_passage=1, max_total=ev_max
-        )
-        ctx_aug2 = []
-        for i, p in enumerate(passages2):
-            ev = evidences2[i] if i < len(evidences2) else None
-            ctx_aug2.append(f"[근거] {ev}\n[본문] {p}" if ev else p)
-
-        prompt = make_prompt_rag_exaone(question, ctx_aug2, use_fewshot=True)
-        out = pipe(
-            prompt,
-            max_new_tokens=(2 if is_mc else 256),
-            do_sample=True, temperature=0.6, top_p=0.95
-        )
-        gen = out[0]["generated_text"]
-
-    # --- 7) 추출 실패 시 샘플링 백업 (기존 로직 유지) ---
+    
+    # --- 4) 추출 실패 시 샘플링 백업 ---
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
     if ans in ("0", "미응답"):
-        max_tokens = (2 if is_mc else 256)
-        outs = pipe(
-            prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,
-            num_return_sequences=3, repetition_penalty=1.05
-        )
+        max_tokens = (2 if is_mc else 512)
+        outs = pipe(prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,
+                    num_return_sequences=3, repetition_penalty=1.05)
         for o in outs:
             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
             if cand not in ("0", "미응답"):
@@ -814,14 +777,13 @@ def answer_with_rag(
                 ans = cand
                 break
 
-    # --- 8) 객관식 후처리 ---
+    # --- 5) 객관식 후처리 ---
     if is_mc:
         m = re.search(r"\b([1-9][0-9]?)\b", gen)
         if not m:
             out = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
             ans = extract_answer_only(gen, original_question=question, prompt=prompt)
-
-    # 반환: 컨텍스트는 증강 버전 우선 반환(디버깅 가독성)
-    contexts_ret = ctx_aug if ctx_aug else contexts
-    return prompt, gen, passages, hits, use_context, contexts_ret, top_meta_for_debug
+    
+    # 멀티 인덱스 디버깅 정보를 되돌려 주면 cmd_run에서 소스 로깅이 쉬워짐
+    return prompt, gen, passages, hits, use_context, contexts, top_meta_for_debug
