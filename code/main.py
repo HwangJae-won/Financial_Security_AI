@@ -1,28 +1,3 @@
-"""
-    # 1) 인덱스 빌드
-    !python code/main.py build --dir "laws/" --kind "law"
-    !python code/main.py build --dir "supplement/" --kind "generic"
-    
-    # 2) 단일 질문
-    !python code/main.py ask --question "전자자금이체의 지급 효력 발생 시점을 전자금융거래법 기준에 따라 설명하세요."
-    !python code/main.py ask --question "금융회사가 정보보호 예산을 관리할 때, 전자금융감독규정상 정보기술부문 인력 및 예산의 기준 비율은 얼마인가요?"
-    
-    !python code/main.py ask --question $'전자금융거래법 제44조에 따르면, 청문 절차가 필요한 경우는 무엇인가?\n1 전자금융거래의 중단\n2 전자금융거래의 보안 점검\n3 전자금융업자의 등록 취소\n4 전자금융거래의 수수료 변경'
-    !python code/main.py ask --question $'국내대리인이 법을 위반한 경우, 그 책임은 누구에게 있는가?\n1 국내대리인\n2 정부기관\n3 법원\n4 정보통신서비스 제공자\n5 개인정보 처리 위탁업체'
-    !python code/main.py ask --question $'개인정보보호법 제63조에 따르면, 보호위원회가 자료제출 요구 및 검사를 통해 수집한 서류나 자료를 제3자에게 제공하거나 일반에 공개할 수 있는 경우는?\n1 자료가 비밀이 아닌 경우\n2 개인정보처리자의 동의가 있는 경우\n3 정보주체가 개인정보 열람을 요청한 경우\n4 법에 따른 경우\n5 보호위원회의 내부 규정에 따른 경우'
-    
-    !python code/main.py ask --question $'다음 중 금융회사 또는 전자금융업자가 책임을 일부 또는 전부 이용자에게 부담시킬 수 있는 경우는?\n1 금융회사의 내부 규정 위반으로 인한 사고\n2 이용자의 중대한 과실로 인한 사고\n3 접근매체의 위조로 인한 사고\n4 전자금융거래와 무관한 사고\n5 전자금융거래 시스템의 일시적인 장애로 인한 사고'
-    !python code/main.py ask --question $'본인확인기관이 본인확인업무를 폐지하고자 할 때, 방송통신위원회에 신고해야 하는 최소 기간은 며칠인가?\n1 45일\n2 90일\n3 30일\n4 60일\n5 15일'
-
-    !python code/main.py ask --question $'네트워크 공유의 동작 원리와 관련된 프로토콜이 아닌 것은?\n1 Netbios\n2 HTTPS\n3 SMTP\n4 Netbeui\n5 P2P'
-    !python code/main.py ask --question $'다음 중 여신전문금융업의 건전한 발전을 도모하기 위해 설립된 기관은 무엇인가?\n1 서민금융진흥원\n2 한국투자공사\n3 여신금융협회\n4 한국자산관리공사\n5 금융정보분석원'
-    
-    # 3) test.csv 한 번에 추론(컬럼명: Question)
-    !python code/main.py run --csv "data/test.csv"
-
-"""
-
-
 import os
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 import torch
@@ -74,7 +49,7 @@ def cmd_ask(args):
     retrB = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "supplement"), device="cpu")
 
     # 2) Reranker 준비
-    rr_model = getattr(args, "rerank_model", "/workspace/models/jina-reranker-v2-base-multilingual")
+    rr_model = getattr(args, "rerank_model", "Alibaba-NLP/gte-multilingual-reranker-base")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
     reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=800)
 
@@ -207,7 +182,11 @@ def cmd_run(args):
         context_flags.append(bool(use_context))
         full_context.append(contexts)
         generated_texts.append(gen)
-        recheck_score.append(meta_dbg[0].get("overlap_ratio", None))
+        ov = None
+        if meta_dbg and isinstance(meta_dbg, list) and len(meta_dbg) > 0:
+            ov = meta_dbg[0].get("overlap_ratio", None)
+        recheck_score.append(ov)
+        # recheck_score.append(meta_dbg[0].get("overlap_ratio", None))
         
         # (옵션) 디버깅용 메타 저장
         if meta_dbg is not None:
@@ -225,7 +204,7 @@ def cmd_run(args):
                 top_scores.append([])
 
     # 4) 제출 파일 저장
-    experiment_name = "test_0828.csv"
+    experiment_name = "supp_add.csv"
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv("data/sample_submission.csv")
     sample_submission['Answer'] = preds
@@ -243,7 +222,7 @@ def cmd_run(args):
     result_with_info["TopScores"] = top_scores
     result_with_info["RecheckScores"] = recheck_score
 
-    result_with_info_path = os.path.join(OUTPUT_PATH, "test_0828_with_info.csv")
+    result_with_info_path = os.path.join(OUTPUT_PATH, "supp_add_with_info.csv")
     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
 

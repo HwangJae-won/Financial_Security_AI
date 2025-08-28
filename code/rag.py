@@ -171,76 +171,90 @@ class RAGIndexer:
 
     def build_many(self, pdf_paths: List[str], index_dir=INDEX_DIR, kind: str = "law"):
         all_chunks, all_sources = [], []
-        metas = []   # ★ 추가: 청크별 메타 담을 리스트
+        metas = []
         total = 0
+        skipped = []  # ← 실패/무효 PDF 기록
+
         for pdf_path in pdf_paths:
-            print(f"📄 PDF 읽는 중: {pdf_path}")
-            raw = load_pdf_text(pdf_path)
-            if not raw.strip():
-                raise ValueError("PDF에서 텍스트를 추출하지 못했습니다. OCR이 필요할 수 있습니다.")
+            try:
+                print(f"📄 PDF 읽는 중: {pdf_path}")
+                raw = load_pdf_text(pdf_path)
 
-            
-            # kind 자동 추정(명시 인자가 'auto'면 추정, 아니면 그대로 사용)
-            use_kind = _guess_kind_from_text(raw) if kind == "auto" else kind
+                # 텍스트가 비었거나 공백뿐이면 스킵
+                if not raw or not raw.strip():
+                    raise ValueError("텍스트 추출 결과가 비었습니다.")
 
-            print(f"🔪 청크 분할 ({use_kind}) 중...")
-            if use_kind == "law":
-                chunks, labels = chunk_law_text(raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP)
-            else:
-                chunks, labels = _chunk_generic(raw, chunk_size=CHUNK_SIZE-100, overlap=CHUNK_OVERLAP)
+                # kind 자동 추정(명시 'auto'일 때만)
+                use_kind = _guess_kind_from_text(raw) if kind == "auto" else kind
 
-            base = os.path.basename(pdf_path)
-            all_chunks.extend(chunks)
-            all_sources.extend([f"{base}::{label}" for label in labels])
-            
-            # --- 메타 작성 ---
-            if use_kind == "law":
-                law_name = _norm_law_name_from_filename(base)
-                for lbl in labels:
-                    m = _parse_label_to_meta(lbl)  # (조/항 숫자 추출; 없으면 None들)
-                    m.update({
-                        "law": law_name,
-                        "source": f"{base}::{lbl}",
-                        "doc_type": "law",
-                        "filename": base,
-                    })
-                    metas.append(_sanitize_meta(m))
-            else:
-                for lbl in labels:
-                    metas.append(_sanitize_meta({
-                        "source": f"{base}::{lbl}",
-                        "doc_type": "attachment",
-                        "filename": base,
-                    }))
-                    
-            total += len(chunks)
-            print(f"  → {base}: {use_kind} 기준 {len(chunks)}개")
+                print(f"🔪 청크 분할 ({use_kind}) 중...")
+                if use_kind == "law":
+                    chunks, labels = chunk_law_text(
+                        raw, by_article=True, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP
+                    )
+                else:
+                    chunks, labels = _chunk_generic(
+                        raw, chunk_size=CHUNK_SIZE-100, overlap=CHUNK_OVERLAP
+                    )
+
+                # 청크가 하나도 없으면 스킵
+                if not chunks:
+                    raise ValueError("생성된 청크가 없습니다.")
+
+                base = os.path.basename(pdf_path)
+                all_chunks.extend(chunks)
+                all_sources.extend([f"{base}::{label}" for label in labels])
+
+                # --- 메타 작성 ---
+                if use_kind == "law":
+                    law_name = _norm_law_name_from_filename(base)
+                    for lbl in labels:
+                        m = _parse_label_to_meta(lbl)
+                        m.update({
+                            "law": law_name,
+                            "source": f"{base}::{lbl}",
+                            "doc_type": "law",
+                            "filename": base,
+                        })
+                        metas.append(_sanitize_meta(m))
+                else:
+                    for lbl in labels:
+                        metas.append(_sanitize_meta({
+                            "source": f"{base}::{lbl}",
+                            "doc_type": "attachment",
+                            "filename": base,
+                        }))
+
+                total += len(chunks)
+                print(f"  → {base}: {use_kind} 기준 {len(chunks)}개")
+
+            except Exception as e:
+                # 문제 있는 PDF는 스킵하고 계속
+                print(f"⚠️ 스킵: '{pdf_path}' 처리 실패: {e}")
+                skipped.append(pdf_path)
+                continue
 
         if total == 0:
-            raise ValueError("인덱싱할 청크가 없습니다.")
+            raise ValueError(f"인덱싱할 청크가 없습니다. 모든 PDF 처리 실패(스킵 {len(skipped)}개).")
+
+        if skipped:
+            # 너무 길면 앞부분만 요약 출력
+            show = skipped[:5]
+            more = f" 외 {len(skipped)-5}개" if len(skipped) > 5 else ""
+            print(f"ℹ️ 건너뛴 PDF: {len(skipped)}개 → {show}{more}")
 
         print(f"🧠 임베딩 계산({self.model_name})... 총 청크 {total}개")
         vectors = self.embedder.encode_passages(all_chunks)  # (N, dim) float32
-        
         if vectors.shape[0] != len(all_chunks):
             raise RuntimeError(f"벡터 수({vectors.shape[0]})와 청크 수({len(all_chunks)}) 불일치")
         dim = vectors.shape[1]
         print(f"  → dim={dim}")
 
         # --- CHROMA: 영구 클라이언트/컬렉션 생성 ---
-        chroma_dir = Path(index_dir)                      # ★ 변경 포인트
+        chroma_dir = Path(index_dir)
         chroma_dir.mkdir(parents=True, exist_ok=True)
         client = PersistentClient(path=str(chroma_dir))
 
-
-        np.save(chroma_dir / "embeddings.npy", vectors)                 # (N, dim) float32
-        with open(chroma_dir / "ids.json", "w", encoding="utf-8") as f:
-            json.dump([f"doc-{i}" for i in range(len(all_chunks))], f, ensure_ascii=False)
-        with open(chroma_dir / "metas.json", "w", encoding="utf-8") as f:
-            json.dump(metas, f, ensure_ascii=False)
-
-        
-        # 중복 빌드를 피하려면 기존 컬렉션 삭제 후 재생성(선택)
         try:
             client.delete_collection(CHROMA_COLLECTION)
             print(f"🗑️ 기존 컬렉션 '{CHROMA_COLLECTION}' 삭제")
@@ -257,7 +271,7 @@ class RAGIndexer:
         assert len(metas) == len(all_chunks), f"metas({len(metas)}) != chunks({len(all_chunks)})"
         collection.add(ids=ids, documents=list(all_chunks), embeddings=vectors.tolist(), metadatas=metas)
 
-        print(f"✅ 저장 완료 | 총 청크 {total}개") 
+        print(f"✅ 저장 완료 | 총 청크 {total}개")
 
 
 # -----------------------------
@@ -554,6 +568,122 @@ def rerank_and_pick(query: str, candidates: List[Dict], reranker, topn: int = 1,
         c["ce_score"] = float(s)
     return sorted(candidates, key=lambda x: x["ce_score"], reverse=True)[:topn]
 
+_SENT_BOUNDARY_PAT = re.compile(r'([\.!?])')  # 기본 구두점
+_KO_ENDINGS = ("다.", "요.", "니다.")        # 한국어 종결 패턴
+
+def split_into_sentences(text: str, max_sentences: int = 40) -> list[str]:
+    """
+    간단/안전한 문장 분할기.
+    - 한국어 종결("다.","요.","니다.")와 .?!를 기준으로 줄바꿈 삽입 후 split.
+    - 과도한 길이/공백/중복 제거.
+    """
+    if not text:
+        return []
+    t = text.strip()
+
+    # 한국어 종결 뒤에 줄바꿈 삽입
+    for end in _KO_ENDINGS:
+        t = t.replace(end + " ", end + "\n").replace(end + "\u3000", end + "\n")
+    # ., ?, ! 뒤에 줄바꿈 삽입
+    t = _SENT_BOUNDARY_PAT.sub(r'\1\n', t)
+
+    # 문장 후보 생성
+    cands = [s.strip() for s in t.splitlines() if s.strip()]
+    # 너무 짧은/너무 긴/중복 제거
+    out, seen = [], set()
+    for s in cands:
+        if len(s) < 3:
+            continue
+        s_norm = s[:400].strip()  # CE 안정성 위해 문장 길이 상한
+        if s_norm in seen:
+            continue
+        seen.add(s_norm)
+        out.append(s_norm)
+        if len(out) >= max_sentences:
+            break
+    return out
+
+def select_top_sentences_with_ce(
+    query: str,
+    passages: list[str],
+    reranker: "STReranker",
+    per_chunk: int = 3,
+    max_sentences: int = 6,
+) -> list[str]:
+    """
+    청크별로 문장을 분할하고, CrossEncoder 점수로 재랭크하여 상위 문장을 모아 리턴.
+    - 청크당 per_chunk개, 전체 max_sentences개 한도.
+    """
+    if not passages or reranker is None:
+        return passages  # 폴백: 문서 통째로 사용
+
+    # 1) 청크별 top-k 문장 뽑기
+    bag = []
+    for ch in passages:
+        sents = split_into_sentences(ch, max_sentences=50)
+        if not sents:
+            continue
+        scores = reranker.score(query, sents, batch_size=32)
+        pair = list(zip(sents, scores))
+        pair.sort(key=lambda x: x[1], reverse=True)
+        bag.extend(pair[: per_chunk])
+
+    if not bag:
+        return passages
+
+    # 2) 전역 상위에서 중복 제거
+    bag.sort(key=lambda x: x[1], reverse=True)
+    uniq, seen = [], set()
+    for s, sc in bag:
+        if s in seen:
+            continue
+        seen.add(s)
+        uniq.append(s)
+        if len(uniq) >= max_sentences:
+            break
+    return uniq
+
+# 간단한 요구사항 추론(숫자 포함 필요 여부 등)
+_NUM_Q_PAT = re.compile(r"(몇|비율|퍼센트|%|기간|시점|일|월|년|횟수|건수|비중)")
+def needs_number(question: str) -> bool:
+    q = (question or "").replace(" ", "")
+    return bool(_NUM_Q_PAT.search(q))
+
+# 토큰 겹침률(기존 함수 재활용)
+def overlap_ratio_answer_contexts(answer: str, contexts: list[str]) -> float:
+    return overlap_ratio_question_contexts(answer, contexts)
+
+
+# 질문 확장(동의어/약어 풀네임 등 최소 사전)
+_SYNONYM_MAP = {
+    "SMTP": ["SMTP (Simple Mail Transfer Protocol)", "전자우편 전송 프로토콜 SMTP"],
+    "TLS":  ["TLS", "SSL/TLS", "전송계층 보안"],
+    "VLAN": ["VLAN", "Virtual LAN"],
+    "DNSSEC": ["DNSSEC", "DNS 보안 확장"],
+    "RAT": ["원격제어 악성코드", "RAT(원격 접근 트로이목마)"],
+}
+
+def expand_query(original: str) -> list[str]:
+    """
+    간단 확장: 약어 치환 + '정의/기능/절차' 꼬리말 추가
+    """
+    outs = [original]
+    for k, exps in _SYNONYM_MAP.items():
+        if k in original:
+            outs.extend([original.replace(k, e) for e in exps])
+            break
+    # 일반 꼬리말 확장
+    outs.append(original + " 정의")
+    outs.append(original + " 주요 기능")
+    outs.append(original + " 절차")
+    # 중복 제거
+    seen, ret = set(), []
+    for q in outs:
+        q = q.strip()
+        if q and q not in seen:
+            seen.add(q)
+            ret.append(q)
+    return ret
 
 
 
@@ -621,8 +751,8 @@ def search_two_indexes_pipeline(
 def search_two_indexes_global_only(
     query: str,
     retrA, retrB,                 # RAGRetriever
-    M_generic_A: int = 20,
-    M_generic_B: int = 20,
+    M_generic_A: int = 1,
+    M_generic_B: int = 1,
     reranker=None,
     keep_for_ce: int = 50,
     topn: int = 3,
@@ -672,7 +802,49 @@ def overlap_ratio_question_contexts(question: str, contexts: List[str]) -> float
             best = r
     return best
 
+def validate_answer(question: str, answer: str, contexts: list[str]) -> tuple[bool, str]:
+    """
+    간단 크리틱:
+    - 너무 짧음 방지
+    - 숫자 요구 시 숫자/기호 포함 확인
+    - 컨텍스트와의 토큰 겹침률 하한
+    """
+    a = (answer or "").strip()
+    if len(a) < 10:
+        return False, "too_short"
 
+    if needs_number(question) and not re.search(r"[\d%]", a):
+        return False, "number_required"
+
+    if contexts:
+        ov = overlap_ratio_answer_contexts(a, contexts)
+        if ov < 0.08:   # 아주 낮으면 근거와 동떨어짐
+            return False, f"low_ctx_overlap({ov:.2f})"
+
+    return True, "ok"
+# def validate_answer(question: str, answer: str, contexts: list[str]) -> bool:
+#     """
+#     간단 검증: 
+#     1) 질문의 키워드가 답변에 포함되는가?
+#     2) 컨텍스트 핵심 단어와 불일치(반대 의미)가 없는가?
+#     """
+#     if not answer or answer.strip() in ["", "0", "미응답"]:
+#         return False
+    
+#     # 질문 키워드 체크
+#     import re
+#     q_tokens = re.findall(r"[가-힣A-Za-z0-9]+", question)
+#     important = [t for t in q_tokens if len(t) > 1]
+#     if important and not any(tok in answer for tok in important):
+#         return False
+    
+#     # 컨텍스트 단어 일치 여부 간단 체크
+#     if contexts:
+#         joined = " ".join(contexts)
+#         if not any(tok in joined for tok in important):
+#             return False
+
+#     return True
 def answer_with_rag(
     question: str,
     retrieverA: RAGRetriever,                # ★ 바뀜: A 인덱스
@@ -750,7 +922,15 @@ def answer_with_rag(
 
     q, opts = extract_question_and_choices(question)
     is_neg = is_negated_question(q)
-    
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # [추가] 주관식이면 컨텍스트를 "문장" 단위로 스나이핑
+    if not is_mc and contexts and reranker is not None:
+        contexts = select_top_sentences_with_ce(
+            question, contexts, reranker,
+            per_chunk=3,        # 청크당 상위 3문장
+            max_sentences=6     # 전체 상위 6문장
+        )
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
     if contexts and overlap >= OVERLAP_TAU and not is_neg and is_mc:
         prompt = make_prompt_recheck(question, contexts=contexts)
         # recheck는 항상 결정적(샘플링 X), 짧게
@@ -763,9 +943,94 @@ def answer_with_rag(
         max_tokens = (2 if is_mc else 512)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"]
+    # rag.py, answer_with_rag() 하단에서 주관식 분기 후 ans 얻은 뒤에 추가
+
+    def _looks_truncated_kor(s: str) -> bool:
+        t = (s or "").rstrip()
+        if len(t) < 30:
+            return False
+        # 문장 종결부호가 없거나, 리스트 항목이 중간에 끊긴 경우
+        ends_ok = re.search(r"(다\.|요\.|니다\.|!|\?|…|\.|。)\s*$", t) is not None
+        dangling_list = re.search(r"(^|\n)\s*[-•–]?\s*\d+[.)]?\s+[^\n]{0,20}$", t) is not None
+        # ‘~으로 악용해’, ‘~을 통하여’ 같은 미완 어절로 끝나는 경우(대략)
+        bad_tail = re.search(r"(고|며|지만|으로|하게|하게끔|하여|해서|하며|면서|함)\s*$", t) is not None
+        return (not ends_ok) or dangling_list or bad_tail
+
+    def _finish_tail_with_llm(pipe, partial: str) -> str:
+        # “마무리만” 요청. 짧게 1~2문장, 헤더/질문/답변/참고 등 금지
+        cont_prompt = (
+            "다음 답변이 문장 중간에서 끊겼습니다. 바로 이어서 1~2문장으로 자연스럽게 마무리하세요.\n"
+            "출력은 마무리 문장만, 다른 헤더나 '질문:'/'답변:' 같은 표시는 금지.\n\n"
+            f"{partial}\n\n"
+            "마무리:"
+        )
+        out2 = pipe(cont_prompt, max_new_tokens=40, do_sample=False)
+        tail = out2[0]["generated_text"]
+        # '마무리:' 이후만 취하고, 헤더/구분선 오기 전까지만 사용
+        tail = re.split(r"마무리:\s*", tail, maxsplit=1)[-1]
+        tail = re.split(r"(^|\n)\s*(###|질문\s*:|답변\s*:|\[참고자료\]|근거\s*:|---)", tail)[0].strip()
+        # 너무 짧거나 노이즈면 빈 처리
+        return tail if len(tail) >= 6 else ""
     
     # --- 4) 추출 실패 시 샘플링 백업 ---
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
+    is_mc, _ = is_multiple_choice(question)
+    if not is_mc and _looks_truncated_kor(ans):
+        tail = _finish_tail_with_llm(pipe, ans)
+        if tail:
+            ans = (ans.rstrip() + " " + tail).strip()
+        else:
+            # 차선책: 끊긴 마지막 줄을 잘라 깔끔하게 마감
+            lines = [ln for ln in ans.rstrip().splitlines() if ln.strip()]
+            if lines:
+                last = lines[-1].strip()
+                if not re.search(r"(다\.|요\.|니다\.|!|\?|…|\.|。)\s*$", last):
+                    lines = lines[:-1]
+            ans = ("\n".join(lines)).rstrip(" ,;:") + ("" if re.search(r"(다\.|요\.|니다\.|!|\?|…|\.|。)$", ans) else "다.")
+    # --- 검증 루프 ---
+    if not validate_answer(question, ans, contexts):
+        outs = pipe(prompt, max_new_tokens=512, do_sample=True, temperature=0.6, top_p=0.95, num_return_sequences=2, return_full_text=False)
+        for o in outs:
+            cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
+            if validate_answer(question, cand, contexts):
+                gen = o["generated_text"].strip()
+                ans = cand
+                break
+      # --- [추가] 간단 검증 + (실패 시) 1회 재검색 루프 -------------------
+    if not is_mc:
+        ok, reason = validate_answer(question, gen, contexts)
+        if not ok:
+            # 1) 질문 확장
+            expanded = expand_query(question)[:4]   # 너무 많지 않게 4개 제한
+            tried = False
+            for qx in expanded:
+                # 2) 재검색(전역 전용) → CE rerank → 문장 스나이핑
+                final2 = search_two_indexes_global_only(
+                    query=qx,
+                    retrA=retrieverA,
+                    retrB=retrieverB,
+                    M_generic_A=M_generic,
+                    M_generic_B=M_generic_B,
+                    reranker=reranker,
+                    keep_for_ce=keep_for_ce,
+                    topn=max(1, top_k),
+                )
+                passages2 = [c["text"] for c in final2[:top_k]]
+                if not passages2:
+                    continue
+                ctx2 = select_top_sentences_with_ce(qx, passages2, reranker, per_chunk=3, max_sentences=6)
+
+                # 3) 재생성(결정적 모드)
+                prompt2 = make_prompt_rag_exaone(question, ctx2, use_fewshot=True)
+                out2 = pipe(prompt2, max_new_tokens=512, do_sample=False)
+                gen2 = out2[0]["generated_text"]
+
+                ok2, reason2 = validate_answer(question, gen2, ctx2)
+                tried = True
+                if ok2:
+                    prompt, gen, contexts = prompt2, gen2, ctx2
+                    break  # 루프 종료(1회 성공)
+            # 최종 실패면 기존 결과 유지 + (필요 시) 샘플링 백업은 기존 코드가 수행
     if ans in ("0", "미응답"):
         max_tokens = (2 if is_mc else 512)
         outs = pipe(prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,

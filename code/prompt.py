@@ -1,39 +1,34 @@
 from typing import List, Optional, Tuple
 from utils import is_multiple_choice, extract_question_and_choices, is_negated_question
 
-# ===== 1) Baseline =====
-
-def make_prompt_baseline(text: str) -> str:
-    is_mc, _ = is_multiple_choice(text)
-    if is_mc:
-        q, opts = extract_question_and_choices(text)
-        return (
-            "당신은 금융보안 전문가입니다.\n"
-            "아래 질문에 대해 적절한 **정답 선택지 번호만 출력**하세요.\n\n"
-            f"질문: {q}\n"
-            f"선택지:\n{chr(10).join(opts)}\n\n"
-            "답변:"
-        )
-    else:
-        return (
-            "당신은 금융보안 전문가입니다.\n"
-            "아래 주관식 질문에 대해 정확하고 간략한 설명을 작성하세요.\n\n"
-            f"질문: {text}\n\n"
-            "답변:"
-        )
+"""
+프롬프트 전략 
+- few-shot 예시 부여 
+- 참고자료로 활용할 컨텍스트 문서가 있다면 참고자료로 지정하여 활용 
+- 역할 지시
+- 객관식 / 주관식 여부 , 참고자료 여부에 따른 4가지 유형의 프롬프트 활용 
+"""
 
 # ===== 2) RAG EXAONE =====
 
 def make_prompt_rag_exaone(
     text: str,
     contexts: Optional[List[str]] = None,
-    use_fewshot: bool = False  # 예시 1개 사용할지 여부
+    use_fewshot: bool = False 
 ) -> str:
+    """ 
+    EXAONE-Deep-7.8B 등 EXAONE 계열에 맞춘 RAG 프롬프트 생성
+    - EXAONE는 지시 준수/형식 엄수에 강함. 근거 설명 출력 금지로 형식 안정화
+    
+     Args:
+        text: 질문 텍스트 (객관식 / 주관식)
+        contexts: 참고자료로 사용할 컨텍스트(문서) 리스트. 없으면 None.
+        use_fewshot: True일 경우, 객관식/주관식 예시 1개를 프롬프트 상단에 추가
+
+    Returns:
+        str: EXAONE 모델 입력에 적합한 프롬프트 문자열.    
     """
-    EXAONE-Deep-7.8B 등 EXAONE 계열에 맞춘 RAG 프롬프트.
-    - 컨텍스트는 하단 [참고자료] 블록으로만 추가(파서 안전).
-    - use_fewshot=True면, MC/주관식 각각 예시 1개를 상단에 추가.
-    """
+    
     # few-shot (간결·형식 고정)
     fewshot_block_mc = ""
     fewshot_block_gen = ""
@@ -59,14 +54,16 @@ def make_prompt_rag_exaone(
     if contexts:
         context_block = "[참고자료]\n" + "\n\n---\n".join(contexts) + "\n\n"
 
+    # 객관식 여부: is_mc일 경우 객관식 문제
     is_mc, _ = is_multiple_choice(text)
 
-    # 역할·지시: EXAONE는 지시 준수/형식 엄수에 강함. 근거 설명 출력 금지로 형식 안정화
+    # 역할·지시
     role = (
         "### 역할\n"
         "당신은 금융보안 전문가이자, 금융보안원 소속의 베테랑 연구원입니다.\n\n"
     )
-
+    
+     # ===== 객관식 =====
     if is_mc:
         q, opts = extract_question_and_choices(text)
         if contexts:
@@ -97,6 +94,7 @@ def make_prompt_rag_exaone(
                 + f"{q}\n\n선택지:\n{chr(10).join(opts)}\n\n"
                 + "답변:"
             )
+    # ===== 주관식 =====
     else:
         if contexts:
             return (
@@ -107,7 +105,7 @@ def make_prompt_rag_exaone(
                 "- 먼저 문제 해결을 위한 사고 과정을 작성하고, 그 후에 최종 답변을 출력하세요.\n"
                 "- 사고 과정과 최종 답변은 명확히 구분하여 작성해야 합니다.\n"
                 "- 출력은 반드시 한국어로, 형식은 아래 예시를 따르세요.\n\n"
-                + (fewshot_block_gen if use_fewshot else "") # 기존 few-shot 유지
+                + (fewshot_block_gen if use_fewshot else "") 
                 + context_block
                 + "### 질문\n"
                 + f"{text}\n\n"
@@ -121,7 +119,7 @@ def make_prompt_rag_exaone(
                 + "### 지시\n"
                 "- [질문]을 자세히 읽고 묻는 바에 빠짐없이 답변하세요.\n"
                 "- 먼저 문제 해결을 위한 사고 과정을 충분히 거친 뒤, 최종 답변을 출력하세요.\n"
-                "- 답변은 핵심 키워드를 중심으로 서술하세요.\n"
+                "- 답변은 핵심 키워드를 중심으로 자세하게 서술하세요.\n"
                 "- 출력은 반드시 한국어로, 형식은 아래 예시를 따르세요.\n\n"
                 + (fewshot_block_gen if use_fewshot else "")
                 + "### 질문\n"
@@ -138,19 +136,31 @@ def make_prompt_recheck(
     contexts: Optional[List[str]] = None,
 ) -> str:
     """
-    RECHECK 프롬프트: 문제(text), 초안답(first_answer), 참고자료(contexts)를 주고
-    '최종 형식만' 출력하도록 강제.
+    RECHECK 프롬프트를 생성: '최종 형식만' 출력하도록 강제
+    - 출력 형식 및 지시 사항을 엄격히 제한
+
+    Args:
+        text: 질문 텍스트 (객관식 / 주관식)
+        contexts: 참고자료로 사용할 컨텍스트(문서) 리스트. 없으면 None.
+
+    Returns:
+        str: RECHECK 모델 입력에 적합한 프롬프트 문자열.
+    
     """
+    
+    #참고 자료
     context_block = ""
     if contexts:
         context_block = "[참고자료]\n" + "\n\n---\n".join(contexts) + "\n\n"
-    
+    #객관식 여부 
     is_mc, _ = is_multiple_choice(text)
+    #역할 지시
     role = (
         "### 역할\n"
         "당신은 금융보안 전문가입니다. 아래 문제와 참고자료를 보고 올바른 답을 결정하세요.\n\n"
     )
     
+    # ===== 객관식 =====
     if is_mc:
         q, opts = extract_question_and_choices(text)
         n = len(opts)

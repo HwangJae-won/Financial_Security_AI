@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# """
+# 주관식 답변 list
+# python code/main.py ask --question "전자자금이체의 지급 효력 발생 시점을 전자금융거래법 기준에 따라 설명하세요."
+# python code/main.py ask --question "금융회사가 정보보호 예산을 관리할 때, 전자금융감독규정상 정보기술부문 인력 및 예산의 기준 비율은 얼마인가요?"
+# python code/main.py ask --question "전자금융거래법에 따라 이용자가 금융 분쟁조정을 신청할 수 있는 기관을 기술하세요."
+# python code/main.py ask --question "DNSSEC의 주요 기능과 이를 통해 해결할 수 있는 보안 위협을 설명하세요."
+# python code/main.py ask --question "딥페이크 기술 악용에 대비한 금융권의 대응 방안을 기술하세요."
+# python code/main.py ask --question "디지털 지갑(Digital Wallet)에서 우려되는 주요 보안 위협을 설명하세요."
+# python code/main.py ask --question "정보보호의 3대 요소에 해당하는 보안 목표를 3가지 기술하세요."
+
+# """
+
+
+
+
 # # 프로젝트 루트로 이동
 # cd "$(dirname "$0")"
 
