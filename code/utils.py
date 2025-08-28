@@ -38,9 +38,30 @@ def extract_question_and_choices(full_text):
     
 
 
+def classify_question_type_tail(full_text: str) -> str:
+    """
+    extract_question_and_choices()로 뽑은 question의 '끝'만 보고 분류:
+    '설명하세요.' / '기술하세요.' / '무엇인가요?' / '기타'
+    """
+    question, _ = extract_question_and_choices(full_text)
+    q = (question or "").strip()
+
+    # 공백-문장부호 정리, 닫는 따옴표/괄호 제거(문장부호는 유지)
+    q = re.sub(r"\s+([?.!])$", r"\1", q)
+    q = re.sub(r'["“”\'’\)\]\}〉》」』\s]+$', "", q)
+
+    if re.search(r"설명하세요\.$", q):
+        return "설명하세요."
+    if re.search(r"기술하세요\.$", q):
+        return "기술하세요."
+    if re.search(r"무엇인가요\?$", q):
+        return "무엇인가요?"
+    return "기타"
+
+
 STOP_MARKERS = [
     "\n---", "\n***",
-    "\n###", "\n[참고", "\n참고자료",
+    "\n###", "\n### 최종답변", "\n[참고", "\n참고자료",
     "\n질문:", "\n[예시",
     "\n지시", "\nInstruction", "\nReferences", "\nAnswer:"
 ]

@@ -14,8 +14,10 @@ import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # 기존 프로젝트 모듈
-from utils import is_multiple_choice, extract_question_and_choices, extract_answer_only, is_negated_question
-from prompt import make_prompt_rag_exaone, make_prompt_recheck
+from utils import (
+    is_multiple_choice, extract_question_and_choices, extract_answer_only, is_negated_question, classify_question_type_tail
+)
+from prompt import make_prompt_rag_exaone, make_prompt_recheck, make_prompt_subjective
 from text_utils import _ensure_dir, load_pdf_text, chunk_law_text, _chunk_generic
 from config import (
     CHUNK_SIZE, CHUNK_OVERLAP, TOP_K, SCORE_THRESHOLD, M_GENERIC, M_FILTERED, OUTPUT_PATH, CHROMA_COLLECTION,
@@ -760,7 +762,11 @@ def answer_with_rag(
         gen = out[0]["generated_text"].strip()
         top_meta_for_debug[0]["recheck"] = True
     else:
-        prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
+        if not is_mc:
+            question_type = classify_question_type_tail(question)
+            prompt = make_prompt_subjective(question, contexts, use_fewshot=True, question_type=question_type)  
+        else:
+            prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
         max_tokens = (2 if is_mc else 512)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"]
