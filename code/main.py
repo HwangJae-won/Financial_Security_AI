@@ -73,7 +73,7 @@ def cmd_ask(args):
     retrB = RAGRetriever(index_dir=os.path.join(INDEX_DIR, "supplement"), device="cpu")
 
     # 2) Reranker 준비
-    rr_model = getattr(args, "rerank_model", "/workspace/models/gte-multilingual-reranker-base")
+    rr_model = getattr(args, "rerank_model", "/workspace/models/jina-reranker-v2-base-multilingual")
     rr_device = "cuda" if torch.cuda.is_available() else "cpu"
     reranker = STReranker(model_name_or_path=rr_model, device=rr_device, max_length=800)
 
@@ -224,7 +224,7 @@ def cmd_run(args):
                 top_scores.append([])
 
     # 4) 제출 파일 저장
-    experiment_name = "result.csv"
+    experiment_name = "test_0828.csv"
     print("📄 제출 파일 생성 중...")
     sample_submission = pd.read_csv("data/sample_submission.csv")
     sample_submission['Answer'] = preds
@@ -242,7 +242,7 @@ def cmd_run(args):
     result_with_info["TopScores"] = top_scores
     result_with_info["RecheckScores"] = recheck_score
 
-    result_with_info_path = os.path.join(OUTPUT_PATH, "result_with_info.csv")
+    result_with_info_path = os.path.join(OUTPUT_PATH, "test_0828_with_info.csv")
     result_with_info.to_csv(result_with_info_path, index=False, encoding='utf-8-sig')
     print(f"✅ 부가 정보 파일 저장 완료: {result_with_info_path}")
 

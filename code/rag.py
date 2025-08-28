@@ -77,35 +77,49 @@ class E5Embedder:
 # -----------------------------
 # Reranker
 # -----------------------------
-
 class STReranker:
-    """
-    Sentence-Transformers CrossEncoder 기반 재정렬기.
-    - 기본 모델: "Alibaba-NLP/gte-multilingual-reranker-base" (멀티링궐)
-    - 입력: (query, passages[list[str]])
-    - 출력: scores[list[float]] (클수록 관련성 높음)
-    """
-    def __init__(self, model_name_or_path: str = "/workspace/models/gte-multilingual-reranker-base", 
+    def __init__(self, model_name_or_path: str = "/dev/shm/models/gte-multilingual-reranker-base", 
                  device: str | None = None, max_length: int = 512, trust_remote_code=True):
-
-         # model_name_or_path에 로컬 디렉토리 or HF 모델명 모두 허용
+        # 로컬 경로/허브 모두 OK
         path = model_name_or_path
         if os.path.isdir(model_name_or_path):
-            # 로컬 디렉토리 우선 사용
             path = model_name_or_path
-            
-        self.model = CrossEncoder(model_name_or_path, device=device, max_length=max_length, trust_remote_code=True)
+
+        self.model = CrossEncoder(path, device=device, max_length=max_length, trust_remote_code=True)
+
+        # *** 중요: 출력 dtype 안정화를 위해 모델을 FP32로 이동 (가능할 때만) ***
+        try:
+            # sentence-transformers의 내부 모델 모듈 접근
+            self.model.model = self.model.model.to(dtype=torch.float32)
+        except Exception:
+            pass
 
     @torch.no_grad()
     def score(self, query: str, passages: list[str], batch_size: int = 32) -> list[float]:
         if not passages:
             return []
-        # 너무 긴 본문이면 대략 자르기(토큰 기준 아님, 안전장치)
         trimmed = [p[:4000] for p in passages]
         pairs = [(query, p) for p in trimmed]
-        scores = self.model.predict(pairs, batch_size=batch_size, convert_to_numpy=True)
-        return scores.tolist()
 
+        # *** 핵심 수정: numpy 변환을 라이브러리에 맡기지 않고 우리가 처리 ***
+        scores = self.model.predict(
+            pairs, batch_size=batch_size, convert_to_numpy=False
+        )
+        # sentence-transformers가 torch.Tensor 또는 list[Tensor/float]를 줄 수 있음
+        if isinstance(scores, torch.Tensor):
+            t = scores.to(torch.float32).detach().cpu()
+            return t.numpy().astype("float32").tolist()
+        elif isinstance(scores, (list, tuple)):
+            out = []
+            for s in scores:
+                if torch.is_tensor(s):
+                    out.append(float(s.to(torch.float32).detach().cpu().item()))
+                else:
+                    out.append(float(s))  # 이미 파이썬 float
+            return out
+        else:
+            # 예외 형태 방어
+            return [float(scores)]
 
 
 # -----------------------------
@@ -533,6 +547,107 @@ def _simple_tokens(s: str, minlen: int = 2) -> set[str]:
     s = re.sub(r"[^0-9A-Za-z가-힣]+", " ", s)
     toks = {t for t in s.split() if len(t) >= minlen and t not in _KO_STOP}
     return toks
+# ==== Sentence-level evidence & simple validation ====
+
+# _SENT_SPLIT = re.compile(r'(?<=[\.!?]|다\.|요\.|니다\.)\s+')
+_SENTENCE_REGEX = re.compile(
+    r'.+?(?:다\.|요\.|니다\.|[.!?])(?=(?:\s+|$))',
+    re.S
+)
+def split_sentences_kor(text: str, min_len: int = 2) -> list[str]:
+    if not text or not text.strip():
+        return []
+    sents = [m.group(0).strip() for m in _SENTENCE_REGEX.finditer(text)]
+    # 문장 종결부호가 전혀 없을 때 폴백
+    if not sents:
+        only = text.strip()
+        return [only] if only else []
+    # 너무 짧은 토막 제거(선택)
+    return [s for s in sents if len(s) >= min_len]
+# def split_sentences_kor(text: str, max_len: int = 400) -> list[str]:
+#     if not text:
+#         return []
+#     # 1) 문장 단위 대충 자르되 너무 긴 문장은 잘라서 후보로
+#     sents = []
+#     for seg in _SENT_SPLIT.split(text.strip()):
+#         seg = seg.strip()
+#         if not seg:
+#             continue
+#         if len(seg) <= max_len:
+#             sents.append(seg)
+#         else:
+#             # 안전 가르기
+#             for i in range(0, len(seg), max_len):
+#                 sents.append(seg[i:i+max_len].strip())
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for s in sents:
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+def extract_evidence_sentences(query: str, passages: list[str], reranker: STReranker | None,
+                               per_passage: int = 1, max_total: int = 2) -> list[str]:
+    """각 passage에서 문장 후보를 뽑고 CrossEncoder로 점수화 → 상위 문장 반환."""
+    if not passages:
+        return []
+    # reranker 없으면 간단 토큰 겹침으로 고름
+    if reranker is None:
+        qtok = _simple_tokens(query)
+        scored = []
+        for p in passages:
+            for s in split_sentences_kor(p):
+                st = _simple_tokens(s)
+                score = len(qtok & st) / max(1, len(qtok))
+                if score > 0:
+                    scored.append((s, score))
+        return [s for s,_ in sorted(scored, key=lambda x: x[1], reverse=True)[:max_total]]
+
+    # CE로 스코어
+    pairs = []
+    sent_map = []
+    for pi, p in enumerate(passages):
+        sents = split_sentences_kor(p)
+        for s in sents:
+            pairs.append((query, s))
+            sent_map.append((pi, s))
+    if not pairs:
+        return []
+    scores = reranker.model.predict(pairs, batch_size=64, convert_to_numpy=True)
+    scored = [(sent_map[i][0], sent_map[i][1], float(scores[i])) for i in range(len(scores))]
+    # passage별 상위 문장 제한 + 전체 top 제한
+    by_pass = {}
+    for pi, s, sc in sorted(scored, key=lambda x: x[2], reverse=True):
+        if by_pass.get(pi, 0) >= per_passage:
+            continue
+        by_pass[pi] = by_pass.get(pi, 0) + 1
+        yield_item = (s, sc)
+        (yield_item)  # just to make intent clear
+    # 다시 전역 top으로 한 번 더 필터
+    merged = []
+    used = set()
+    for pi, s, sc in sorted(scored, key=lambda x: x[2], reverse=True):
+        if s in used:
+            continue
+        merged.append((s, sc))
+        used.add(s)
+        if len(merged) >= max_total:
+            break
+    return [s for s,_ in merged]
+
+def validate_answer_mc(generated: str) -> bool:
+    return bool(re.search(r"\b([0-9]{1,2})\b", generated))
+
+def validate_answer_gen(generated: str, min_len: int = 12) -> bool:
+    g = (generated or "").strip()
+    if len(g) < min_len:
+        return False
+    bad = ["모르겠습니다", "답변할 수 없습니다", "정보가 없습니다"]
+    if any(b in g for b in bad):
+        return False
+    return True
 
 def overlap_ratio_question_contexts(question: str, contexts: List[str]) -> float:
     """
@@ -551,21 +666,20 @@ def overlap_ratio_question_contexts(question: str, contexts: List[str]) -> float
             best = r
     return best
 
-
 def answer_with_rag(
     question: str,
-    retrieverA: RAGRetriever,                # ★ 바뀜: A 인덱스
-    retrieverB: RAGRetriever,                # ★ 바뀜: B 인덱스
+    retrieverA: RAGRetriever,                # A 인덱스 (laws)
+    retrieverB: RAGRetriever,                # B 인덱스 (supplement)
     pipe,
     top_k=TOP_K,
     score_threshold: float = SCORE_THRESHOLD,
     reranker: Optional["STReranker"] = None,
     rerank_threshold: float = RERANK_THRESHOLD,
-    M_generic: int = M_GENERIC,              # A의 전역 후보 (기존 의미 유지)
-    M_filtered: int = M_FILTERED,            # A의 필터 후보
-    M_generic_B: int = None,                 # ★ 추가: B 전역 후보 (기본 없으면 M_generic과 동일)
-    keep_for_ce: int = 50,                   # ★ 추가: CE에 태울 최대 후보 수
-    use_clause: bool = True,                 # ★ 추가: 항 단위까지 필터
+    M_generic: int = M_GENERIC,              # A 전역 후보
+    M_filtered: int = M_FILTERED,            # A 필터 후보
+    M_generic_B: int = None,                 # B 전역 후보 (기본 M_generic)
+    keep_for_ce: int = 50,                   # CE에 태울 최대 후보 수
+    use_clause: bool = True,                 # 항 단위까지 필터
 ):
     if M_generic_B is None:
         M_generic_B = M_generic
@@ -586,69 +700,113 @@ def answer_with_rag(
         top_score = final[0]["ce_score"] if final else float("-inf")
         use_context = (len(final) > 0) and (top_score >= rerank_threshold)
 
-        # 디버깅/호환용: hits는 (pseudo) 튜플로 만들어 두되, 인덱스 구분을 위해 문자열 키 사용
+        # 멀티 인덱스: hits는 ("A:idx"/"B:idx", ce_score) 형태
         hits = [(f'{c["retriever"]}:{c["idx"]}', c["ce_score"]) for c in final[:top_k]]
-
-        # 멀티 인덱스이므로 contexts는 passages 자체를 씀
         contexts = passages if use_context else []
         top_meta_for_debug = [
             {"retriever": c["retriever"], "source": c.get("source","unknown"), "score": c["ce_score"]} 
             for c in final[:top_k]
         ]
-
     else:
-        # --- 주관식 처리: 두 인덱스 전역 검색만 수행 후 rerank ---
+        # --- 주관식: 두 인덱스 전역 검색 → CE rerank
         final = search_two_indexes_global_only(
             query=question,
             retrA=retrieverA,
             retrB=retrieverB,
-            M_generic_A=M_generic,     # laws 인덱스 전역 후보 수
-            M_generic_B=M_generic_B,   # supplement 인덱스 전역 후보 수
+            M_generic_A=M_generic,     # laws 전역 후보
+            M_generic_B=M_generic_B,   # supplement 전역 후보
             reranker=reranker,
             keep_for_ce=keep_for_ce,
             topn=max(1, top_k),
         )
-
         passages = [c["text"] for c in final[:top_k]]
         top_score = final[0]["ce_score"] if final else float("-inf")
-        use_context = (len(final) > 0) and (top_score >= score_threshold)  # 게이트는 score_threshold 재사용
+        use_context = (len(final) > 0) and (top_score >= score_threshold)
 
-        # hits와 meta_dbg 준비
         hits = [(f'{c["retriever"]}:{c["idx"]}', c["ce_score"]) for c in final[:top_k]]
         contexts = passages if use_context else []
         top_meta_for_debug = [
             {"retriever": c["retriever"], "source": c.get("source", "unknown"), "score": c["ce_score"]}
             for c in final[:top_k]
         ]
-    
-    # --- ★ 추가: 질문-컨텍스트 겹침률 계산 ---
+
+    # --- 2) (추가) 질문-컨텍스트 겹침률 기록 ---
     overlap = overlap_ratio_question_contexts(question, contexts)
-    # 필요하면 디버깅 메타에 기록
     if top_meta_for_debug:
         top_meta_for_debug[0]["overlap_ratio"] = float(overlap)
 
+    # --- 3) (추가) 문장 단위 근거 추출 & 컨텍스트 증강 ---
+    ev_max = (1 if is_mc else 2)  # MC 1문장, 주관식 1~2문장
+    evidences = extract_evidence_sentences(
+        question, passages if use_context else [], reranker, per_passage=1, max_total=ev_max
+    )
+
+    if use_context and passages:
+        ctx_aug = []
+        for i, p in enumerate(passages[:top_k]):
+            ev = evidences[i] if i < len(evidences) else None
+            ctx_aug.append(f"[근거] {ev}\n[본문] {p}" if ev else p)
+    else:
+        ctx_aug = []
+
+    # --- 4) 프롬프트 & 1차 생성 ---
     q, opts = extract_question_and_choices(question)
     is_neg = is_negated_question(q)
-    
-    if contexts and overlap >= OVERLAP_TAU and not is_neg and is_mc:
-        prompt = make_prompt_recheck(question, contexts=contexts)
-        # recheck는 항상 결정적(샘플링 X), 짧게
-        max_tokens = (40 if is_mc else 256)
+
+    if ctx_aug and overlap >= OVERLAP_TAU and not is_neg and is_mc:
+        # RECHECK 경로: 결정적으로 짧게
+        prompt = make_prompt_recheck(question, contexts=ctx_aug)
+        max_tokens = 40
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"].strip()
         top_meta_for_debug[0]["recheck"] = True
     else:
-        prompt = make_prompt_rag_exaone(question, contexts, use_fewshot=True)
+        prompt = make_prompt_rag_exaone(question, ctx_aug, use_fewshot=True)
         max_tokens = (2 if is_mc else 256)
         out = pipe(prompt, max_new_tokens=max_tokens, do_sample=False)
         gen = out[0]["generated_text"]
-    
-    # --- 4) 추출 실패 시 샘플링 백업 ---
+
+    # --- 5) (추가) 간단 검증 ---
+    ok = validate_answer_mc(gen) if is_mc else validate_answer_gen(gen)
+    need_retry = (not ok) or (use_context and overlap < OVERLAP_TAU * 0.6)
+
+    # --- 6) (추가) 실패 시 1회 재검색·재생성 ---
+    if need_retry:
+        # 후보폭 확장: 전역 후보 수/keep_for_ce 2배(상한 있음)
+        final_retry = search_two_indexes_global_only(
+            query=question,
+            retrA=retrieverA, retrB=retrieverB,
+            M_generic_A=min(M_generic*2, 50),
+            M_generic_B=min(M_generic_B*2, 50),
+            reranker=reranker,
+            keep_for_ce=min(keep_for_ce*2, 100),
+            topn=max(1, top_k),
+        )
+        passages2 = [c["text"] for c in final_retry[:top_k]]
+        evidences2 = extract_evidence_sentences(
+            question, passages2, reranker, per_passage=1, max_total=ev_max
+        )
+        ctx_aug2 = []
+        for i, p in enumerate(passages2):
+            ev = evidences2[i] if i < len(evidences2) else None
+            ctx_aug2.append(f"[근거] {ev}\n[본문] {p}" if ev else p)
+
+        prompt = make_prompt_rag_exaone(question, ctx_aug2, use_fewshot=True)
+        out = pipe(
+            prompt,
+            max_new_tokens=(2 if is_mc else 256),
+            do_sample=True, temperature=0.6, top_p=0.95
+        )
+        gen = out[0]["generated_text"]
+
+    # --- 7) 추출 실패 시 샘플링 백업 (기존 로직 유지) ---
     ans = extract_answer_only(gen, original_question=question, prompt=prompt)
     if ans in ("0", "미응답"):
         max_tokens = (2 if is_mc else 256)
-        outs = pipe(prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,
-                    num_return_sequences=3, repetition_penalty=1.05)
+        outs = pipe(
+            prompt, max_new_tokens=max_tokens, do_sample=True, temperature=0.6, top_p=0.95,
+            num_return_sequences=3, repetition_penalty=1.05
+        )
         for o in outs:
             cand = extract_answer_only(o["generated_text"], original_question=question, prompt=prompt)
             if cand not in ("0", "미응답"):
@@ -656,13 +814,14 @@ def answer_with_rag(
                 ans = cand
                 break
 
-    # --- 5) 객관식 후처리 ---
+    # --- 8) 객관식 후처리 ---
     if is_mc:
         m = re.search(r"\b([1-9][0-9]?)\b", gen)
         if not m:
             out = pipe(prompt, max_new_tokens=2, do_sample=True, temperature=0.6, top_p=0.95)
             gen = out[0]["generated_text"]
             ans = extract_answer_only(gen, original_question=question, prompt=prompt)
-    
-    # 멀티 인덱스 디버깅 정보를 되돌려 주면 cmd_run에서 소스 로깅이 쉬워짐
-    return prompt, gen, passages, hits, use_context, contexts, top_meta_for_debug
+
+    # 반환: 컨텍스트는 증강 버전 우선 반환(디버깅 가독성)
+    contexts_ret = ctx_aug if ctx_aug else contexts
+    return prompt, gen, passages, hits, use_context, contexts_ret, top_meta_for_debug

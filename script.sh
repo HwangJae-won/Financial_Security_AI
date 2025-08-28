@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# 프로젝트 루트로 이동
-cd "$(dirname "$0")"
+# # 프로젝트 루트로 이동
+# cd "$(dirname "$0")"
 
 # 0) (선택) venv 활성화가 필요하면 주석 해제
 # source venv/bin/activate
@@ -27,9 +27,9 @@ fi
 usage() {
   cat <<USAGE
 Usage:
-  bash run_fsai.sh build_all                # laws/ 와 supplement/ 인덱스 빌드
-  bash run_fsai.sh ask "질문 내용"           # 단일 질문 추론
-  bash run_fsai.sh run data/test.csv        # CSV 일괄 추론 (컬럼명: Question)
+  bash script.sh build_all                # laws/ 와 supplement/ 인덱스 빌드
+  bash script.sh ask "질문 내용"           # 단일 질문 추론
+  bash script.sh run data/test.csv        # CSV 일괄 추론 (컬럼명: Question)
 USAGE
 }
 
@@ -69,7 +69,7 @@ case "$cmd" in
     fi
     echo "🧪 CSV 일괄 추론 시작: $csv_path"
     python code/main.py run --csv "$csv_path"
-    echo "✅ 완료. 결과는 results/result.csv 및 results/result_with_info.csv"
+    echo "✅ 완료.sv"
     ;;
 
   *)
