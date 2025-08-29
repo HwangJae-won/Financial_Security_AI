@@ -16,8 +16,10 @@
 
     !python code/main.py ask --question $'네트워크 공유의 동작 원리와 관련된 프로토콜이 아닌 것은?\n1 Netbios\n2 HTTPS\n3 SMTP\n4 Netbeui\n5 P2P'
     !python code/main.py ask --question $'다음 중 여신전문금융업의 건전한 발전을 도모하기 위해 설립된 기관은 무엇인가?\n1 서민금융진흥원\n2 한국투자공사\n3 여신금융협회\n4 한국자산관리공사\n5 금융정보분석원'
+개인정보보호법 제38조에 의하면, 개인정보처리자가 정보주체의 열람등요구에 대해 거절할 경우, 정보주체가 취할 수 있는 조치는 무엇인가?
 
-    !python code/main.py ask --question $'침입차단시스템(Firewall)의 주요 기능으로 옳지 않은 것은?\n1 네트워크 트래픽 모니터링\n2 패킷 필터링\n3 악성코드 탐지 및 제거\n4 암호화된 데이터 복호화\n5 접근 제어'
+
+    !python code/main.py ask --question $'개인정보보호법 제64조에 의거하여, 개인정보 보호위원회가 시정조치를 명할 수 없는 기관은?\n1 지방자치단체\n2 금융감독원\n3 헌법재판소\n4 중앙행정기관\n5 국회'
     
     # 3) test.csv 한 번에 추론(컬럼명: Question)
     !python code/main.py run --csv "data/test.csv"

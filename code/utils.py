@@ -5,8 +5,8 @@ import unicodedata
 
 _NEG_PATTS = [
     r"옳지\s*않", r"맞지\s*않", r"아닌\s*것", r"아니(?:다|며?)",
-    r"불가", r"금지", r"제외", r"해당하지\s*않",
-    r"옳은\s*것이\s*아닌", r"타당하지\s*않",
+    r"불가", r"금지", r"제외", r"해당하지\s*않", '포함되지\s않'
+    r"옳은\s*것이\s*아닌", r"타당하지\s*않", r"않는", r"없는",
     r"\bNOT\b", r"\bFALSE\b", r"\bincorrect\b", r"\bexcept\b"
 ]
 

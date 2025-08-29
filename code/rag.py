@@ -118,28 +118,47 @@ class STReranker:
 _ART_RE = re.compile(r"제\s*(\d+)\s*조(?:\s*의\s*(\d+))?", re.UNICODE)  # 제22조의2 → (22, 2)
 _CLAUSE_RE = re.compile(r"(?:제)?\s*(\d+)\s*항")
 
-def _norm_law_name_from_filename(base: str) -> str:
-    name = os.path.splitext(base)[0]
-    name = re.sub(r"[（(].*?[）)]", "", name)   # 괄호 내용 제거: () / （）
-    name = re.sub(r"\s+", "", name)            # 모든 공백 제거
+CANON7 = {
+    "개인정보보호법",
+    "정보통신망법",
+    "전자금융거래법",
+    "전자금융감독규정",
+    "신용정보법",
+    "신용정보업감독규정",
+    "전자서명법",
+}
 
-    if "신용정보업감독규정" in name:
-        return "신용정보업감독규정"
-    if "전자금융감독규정" in name:
-        return "전자금융감독규정"
-    if "전자금융거래법" in name:
-        return "전자금융거래법"
-    if "전자서명법" in name:
-        return "전자서명법"
-    if "신용정보의이용및보호에관한법률" in name or "신용정보법" in name:
-        return "신용정보법"
-    if ("정보통신망이용촉진및정보보호등에관한법률" in name
-        or "정보통신망법" in name or "정보통신방법" in name):
-        return "정보통신방법"  # 원한 표기대로
-    if "개인정보보호법" in name or ("개인정보" in name and "보호법" in name):
+def _normkey(s: str) -> str:
+    t = unicodedata.normalize("NFKC", str(s)).strip().lower()
+    t = re.sub(r"[（(].*?[）)]", "", t)  # 괄호 내용 제거
+    t = re.sub(r"\s+", "", t)           # 공백 제거
+    return t
+
+def canon7_from_string(s: str) -> str | None:
+    """문자열에서 7개 중 하나로 정규화 (없으면 None)."""
+    if not s: 
+        return None
+    k = _normkey(s)
+    # 대표 별칭/원표기 모두 흡수
+    if "개인정보보호법" in k or ("개인정보" in k and "보호법" in k):
         return "개인정보보호법"
+    if "정보통신망" in k and "법" in k:  # '정보통신망이용촉진및정보보호등에관한법률' 포함
+        return "정보통신망법"
+    if "전자금융감독규정" in k:
+        return "전자금융감독규정"
+    if "전자금융거래법" in k:
+        return "전자금융거래법"
+    if "신용정보업감독규정" in k:
+        return "신용정보업감독규정"
+    if "신용정보의이용및보호에관한법률" in k or "신용정보법" in k:
+        return "신용정보법"
+    if "전자서명법" in k:
+        return "전자서명법"
+    return None
 
-    return name
+def _norm_law_name_from_filename(base: str) -> str | None:
+    name = os.path.splitext(base)[0]
+    return canon7_from_string(name)  # ← 7개 중 하나 or None
 
 def _parse_label_to_meta(label: str):
     s = label.replace(" ", "")
@@ -301,6 +320,12 @@ def _where_all(**kv):
     return {"$and": terms}
     
 
+def _i(x):
+    if x is None: return None
+    if isinstance(x, int): return x
+    m = re.findall(r"\d+", str(x))
+    return int(m[0]) if m else None
+        
 class RAGRetriever:
     def __init__(self, index_dir=INDEX_DIR, device=None, collection_name=CHROMA_COLLECTION):
         # --- CHROMA: 로드 (빌드 시 사용한 경로 그대로) ---
@@ -463,7 +488,8 @@ class RAGRetriever:
         USE_EXACT = True  # ★ 결정적 검색 활성화
         if self._n_index <= 0:
             return []
-        law, a_num, a_bis, clause, _ = _extract_explicit_law_and_article(query)
+        q, opts = extract_question_and_choices(query)
+        law, a_num, a_bis, clause, _ = _extract_explicit_law_and_article(q)
         if not (law and (a_num is not None)):
             return []
     
@@ -471,17 +497,12 @@ class RAGRetriever:
         mask = []
         metas = getattr(self, "_metas", [])
         for i, m in enumerate(metas):
-            if not m: 
-                continue
-            if m.get("law") != law: 
-                continue
-            if m.get("article_num") != a_num: 
-                continue
-            if m.get("article_bis") != a_bis: 
-                continue
+            if not m: continue
+            if m.get("law") != law: continue
+            if _i(m.get("article_num")) != _i(a_num): continue
+            if _i(m.get("article_bis")) != _i(a_bis): continue
             if use_clause and (clause is not None):
-                if m.get("clause") != clause:
-                    continue
+                if _i(m.get("clause")) != _i(clause): continue
             mask.append(i)
     
         # 항 단위가 없거나 mask가 비면 조 단위 폴백
